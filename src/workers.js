@@ -99,7 +99,14 @@ let tokenCache = { value: null, expires: 0 };
 let dirsCache = { value: null, expires: 0 };
 let usersCache = { value: null, expires: 0 };
 let secretCache = null;
-let setupDone = false;
+let setupDoneAt = 0;
+const isDone = () => setupDoneAt > Date.now();
+const markDone = () => { setupDoneAt = Date.now() + 30000; };
+const resetCaches = () => {
+    usageCache = { value: null, expires: 0 }; tokenCache = { value: null, expires: 0 }; dirsCache = { value: null, expires: 0 };
+    usersCache = { value: null, expires: 0 }; cfgCache = { value: null, expires: 0 }; secretCache = null;
+    folderCache.clear(); fileCache.clear(); metaCache.clear(); scopeCache.clear(); okCache.clear();
+};
 const SETUP_TYPES = ["root", "folder", "shared_drive"];
 let rootId = null;
 const folderCache = new Map();
@@ -726,10 +733,10 @@ async function setupStatus(env) {
     return { bound: true, missing: { creds: !(ok(g) || ok(d)), dirs: !(Array.isArray(a) && a.length), users: !(Array.isArray(u) && u.length) } };
 }
 async function needsSetup(env) {
-    if (setupDone) return false;
+    if (isDone()) return false;
     const st = await setupStatus(env);
     const open = !st.bound || st.missing.creds || st.missing.dirs || st.missing.users;
-    if (!open) setupDone = true;
+    if (open) { setupDoneAt = 0; resetCaches(); } else markDone();
     return open;
 }
 async function setupFinish(request, env, url, st, hdr) {
@@ -800,7 +807,7 @@ async function setupFinish(request, env, url, st, hdr) {
     tokenCache = { value: token, expires: token ? Date.now() + 3300 * 1000 : 0 };
     dirsCache = { value: null, expires: 0 };
     usersCache = { value: null, expires: 0 };
-    setupDone = true;
+    markDone();
     return json({ ok: true }, 200, hdr);
 }
 async function handleSetup(request, env, url) {
@@ -808,9 +815,11 @@ async function handleSetup(request, env, url) {
     const path = url.pathname.replace(/\/+$/, "");
     const isApi = path.startsWith("/setup/api/");
     const closed = () => (isApi ? json({ error: "Setup is complete." }, 404, hdr) : page(ERROR_PAGE, 404));
-    if (setupDone) return closed();
+    if (isDone()) return closed();
     const st = await setupStatus(env);
-    if (st.bound && !st.missing.creds && !st.missing.dirs && !st.missing.users) { setupDone = true; return closed(); }
+    if (st.bound && !st.missing.creds && !st.missing.dirs && !st.missing.users) { markDone(); return closed(); }
+    setupDoneAt = 0;
+    resetCaches();
     if (request.method === "GET" && path === "/setup") return page(SETUP_PAGE, 200, hdr);
     if (request.method === "GET" && path === "/setup/api/status") return json(st, 200, hdr);
     if (request.method === "POST" && path === "/setup/api/finish") return setupFinish(request, env, url, st, hdr);
