@@ -1,6 +1,6 @@
 # DriveFlare
 
-![DriveFlare](images/banner.png)
+![DriveFlare](images/banner.jpg)
 
 A single-file Cloudflare Worker that turns a Google Drive (or a subset of folders / shared drives) into a self-hosted, multi-user file browser — with its own login system, previews, sharing, stars, and an admin panel. No build step, no framework, no database beyond Workers KV.
 
