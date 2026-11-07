@@ -24,6 +24,15 @@ const ALLOWED = {
 const ERROR_PAGE = "<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 const INDEX_PATHS = new Set(["/", "/index", "/index.html", "/index.htm", "/index.php"]);
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' https://cdnjs.cloudflare.com; frame-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+const SEC = {
+    "Content-Security-Policy": CSP,
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+};
 const FAVICON = '<svg width="800" height="741.3696" viewBox="0 0 800 741.3696" fill="none" xmlns="http://www.w3.org/2000/svg"><mask id="a" width="168" height="154" x="12" y="18" maskUnits="userSpaceOnUse"><path fill="#fff" d="M63.09 37c14.626-25.333 51.193-25.334 65.819 0l45.033 78c14.626 25.334-3.657 57.001-32.91 57.001H50.967c-29.253 0-47.536-31.667-32.91-57.001Z"/></mask><g mask="url(#a)" transform="matrix(4.8140532,0,0,4.8140532,-62.146701,-86.652356)"><path fill="url(#b)" d="M206.905 172.02h-91.888l-19.015-32.934 45.944-79.578Z"/><path fill="url(#c)" d="M-14.919 172.006 50.04 59.494v.002L31.032 92.422h38.02L115 172.004l-129.918.001Z"/><path fill="url(#d)" d="M96.007-20.085 141.954 59.5l-19.011 32.928H31.048Z"/></g><defs><linearGradient id="b" x1="193.6" x2="103.09" y1="165.6" y2="111.21" gradientUnits="userSpaceOnUse"><stop offset=".09" stop-color="#ffe921"/><stop offset="1" stop-color="#fec700"/></linearGradient><linearGradient id="c" x1="114.4" x2="15.53" y1="181.61" y2="121.8" gradientUnits="userSpaceOnUse"><stop offset=".15" stop-color="#a9a8ff"/><stop offset=".33" stop-color="#6d97ff"/><stop offset=".48" stop-color="#3186ff"/></linearGradient><linearGradient id="d" x1="128.88" x2="28.7" y1="37.88" y2="84.64" gradientUnits="userSpaceOnUse"><stop offset=".55" stop-color="#0ebc5f"/><stop offset=".85" stop-color="#78c9ff"/></linearGradient></defs></svg>';
 
 const appIcon = m => {
@@ -49,13 +58,13 @@ const manifestFor = cfg => ({
             { src: "/icon-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" },
         ],
     shortcuts: [
-        { name: "Shared", url: "/#/shared", icons: [] },
-        { name: "Starred", url: "/#/starred", icons: [] },
-        { name: "Recent", url: "/#/recent", icons: [] },
-    ].map(s => ({ name: s.name, url: s.url })),
+        { name: "Shared", url: "/#/shared" },
+        { name: "Starred", url: "/#/starred" },
+        { name: "Recent", url: "/#/recent" },
+    ],
 });
 const SW_JS = `const V = "v1", C = "app-" + V, X = "ext-" + V;
-const EXT = ["fonts.googleapis.com", "fonts.gstatic.com", "cdn.tailwindcss.com"];
+const EXT = ["fonts.googleapis.com", "fonts.gstatic.com", "cdn.tailwindcss.com", "cdnjs.cloudflare.com"];
 const swr = async (r, name) => {
     const c = await caches.open(name);
     const h = await c.match(r);
@@ -156,6 +165,8 @@ function sha1(msg) {
 }
 const hexOf = u => [...u].map(b => b.toString(16).padStart(2, "0")).join("");
 const r2top = binding => hexOf(sha1(enc.encode("r2:" + binding))).toUpperCase();
+const isR2 = o => !!o && typeof o.list === "function" && typeof o.head === "function";
+const r2Bindings = env => Object.keys(env || {}).filter(k => isR2(env[k]));
 function r2ks(tagHex, n) {
     const out = new Uint8Array(n);
     for (let i = 0; i * 16 < n; i++) out.set(md5(enc.encode(secretCache + "|s|" + tagHex + "|" + i)).subarray(0, Math.min(16, n - i * 16)), i * 16);
@@ -202,7 +213,7 @@ async function r2File(env, dirs, disk, key) {
     if (!o) return null;
     const name = key.split("/").pop();
     if (!ALLOWED[extOf(name)]) return null;
-    return { id: r2enc(d.id, key), name, size: o.size, mimeType: ALLOWED[extOf(name)], modifiedTime: o.uploaded ? new Date(o.uploaded).toISOString() : null, r2: { b, key } };
+    return { id: r2enc(d.id, key), name, size: o.size, mimeType: ALLOWED[extOf(name)], modifiedTime: o.uploaded ? new Date(o.uploaded).toISOString() : null, etag: o.httpEtag || null, r2: { b, key } };
 }
 async function r2List(url, env, dirs, r2) {
     await getSecret(env);
@@ -254,6 +265,15 @@ async function r2Search(env, dirs, disk, prefix, q) {
     const parts = prefix.split("/").filter(Boolean);
     return json({ disk, scope: parts.length ? parts[parts.length - 1] : d.name, files: out.slice(0, 150) });
 }
+async function r2Bytes(b) {
+    let n = 0, cursor, pages = 0;
+    do {
+        const r = await b.list({ limit: 1000, cursor });
+        for (const o of r.objects || []) n += o.size;
+        cursor = r.truncated ? r.cursor : undefined;
+    } while (cursor && ++pages < 25);
+    return { n, approx: !!cursor };
+}
 
 let usageCache = { value: null, expires: 0 };
 let tokenCache = { value: null, expires: 0 };
@@ -301,15 +321,16 @@ async function getConfig(env) {
 }
 function brand(html, cfg) {
     return html
-        .replaceAll("__NAME_JSON__", JSON.stringify(cfg.name).replace(/</g, "\\u003c"))
-        .replaceAll("__NAME__", escHtml(cfg.name));
+        .replaceAll("__PDFJS__", () => PDFJS)
+        .replaceAll("__NAME_JSON__", () => JSON.stringify(cfg.name).replace(/</g, "\\u003c"))
+        .replaceAll("__NAME__", () => escHtml(cfg.name));
 }
 
 function page(body, status, headers = {}) {
-    return new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8", "Server": "nginx", ...headers } });
+    return new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8", "Server": "nginx", ...SEC, ...headers } });
 }
 function json(data, status = 200, headers = {}) {
-    return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Server": "nginx", "Cache-Control": "no-store", ...headers } });
+    return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Server": "nginx", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...headers } });
 }
 
 const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -390,14 +411,25 @@ async function apiLogout(request, env) {
     const rest = list.filter((_, k) => k !== i);
     return json({ users: rest.map(a => a.name) }, 200, { "Set-Cookie": cookieHeader(rest.map(a => a.token)) });
 }
+async function driveQuota(env) {
+    const token = await tokenOrNull(env);
+    if (!token) return null;
+    const j = await authFetch(token, "https://www.googleapis.com/drive/v3/about?fields=storageQuota");
+    if (!j || !j.storageQuota) return null;
+    const q = j.storageQuota;
+    return { limit: Number(q.limit) || 0, usage: Number(q.usage) || 0, drive: Number(q.usageInDrive) || 0, trash: Number(q.usageInDriveTrash) || 0 };
+}
 async function apiUsage(env) {
     if (usageCache.value && usageCache.expires > Date.now()) return json(usageCache.value);
-    const token = await tokenOrNull(env);
-    if (!token) return json({ error: "Usage unavailable" }, 502);
-    const j = await authFetch(token, "https://www.googleapis.com/drive/v3/about?fields=storageQuota");
-    if (!j || !j.storageQuota) return json({ error: "Usage unavailable" }, 502);
-    const q = j.storageQuota;
-    const v = { limit: Number(q.limit) || 0, usage: Number(q.usage) || 0, drive: Number(q.usageInDrive) || 0, trash: Number(q.usageInDriveTrash) || 0 };
+    const dirs = await getdirs(env);
+    const buckets = [...new Set(dirs.filter(d => d.type === "r2" && isR2(env[d.id])).map(d => d.id))];
+    const hasDrive = dirs.some(d => d.type !== "r2");
+    const [dq, rs] = await Promise.all([hasDrive ? driveQuota(env) : null, Promise.all(buckets.map(id => r2Bytes(env[id])))]);
+    if (hasDrive && !dq && !buckets.length) return json({ error: "Usage unavailable" }, 502);
+    const v = {
+        limit: dq ? dq.limit : 0, usage: dq ? dq.usage : 0, drive: dq ? dq.drive : 0, trash: dq ? dq.trash : 0,
+        r2: buckets.length ? rs.reduce((a, r) => a + r.n, 0) : null, approx: rs.some(r => r.approx),
+    };
     usageCache = { value: v, expires: Date.now() + 300000 };
     return json(v);
 }
@@ -455,6 +487,14 @@ async function apiLogin(request, env) {
     return json({ user, u: names.indexOf(user), users: names }, 200, { "Set-Cookie": cookieHeader(list.map(p => p.token)) });
 }
 
+async function exchangeToken(c) {
+    let res;
+    try {
+        res = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: c.client_id, client_secret: c.client_secret, refresh_token: c.refresh_token, grant_type: "refresh_token" }) });
+    } catch (e) { return { net: true }; }
+    if (!res.ok) return {};
+    return { token: (await res.json()).access_token };
+}
 async function getToken(env) {
     const now = Date.now();
     if (tokenCache.value && tokenCache.expires > now + 30000) return tokenCache.value;
@@ -477,7 +517,7 @@ async function getToken(env) {
     const j = await res.json();
     const expires = Date.now() + 3300 * 1000;
     tokenCache = { value: j.access_token, expires };
-    try { await env.gdrive.put("drive_access", JSON.stringify({ access_token: j.access_token, expires }), { expirationTtl: 3600 }); } catch (e) { console.error(String(e)); }
+    try { await env.gdrive.put("drive_access", JSON.stringify({ access_token: j.access_token, expires }), { expirationTtl: 3600 }); } catch (e) { }
     return tokenCache.value;
 }
 async function tokenOrNull(env) {
@@ -489,6 +529,16 @@ async function getdirs(env) {
     if (!Array.isArray(dirs)) throw new Error("dirs");
     dirsCache = { value: dirs, expires: Date.now() + 60000 };
     return dirs;
+}
+async function getMode(env, dirs) {
+    const sg = await kvJson(env, "storage");
+    if (sg && ["drive", "r2", "both"].includes(sg.mode)) return sg.mode;
+    const r = dirs.some(d => d.type === "r2"), dr = dirs.some(d => d.type !== "r2");
+    return r && dr ? "both" : r ? "r2" : "drive";
+}
+async function hasCreds(env) {
+    const [g, d] = await Promise.all([kvJson(env, "gdrive_json"), kvJson(env, "drive_token")]);
+    return !!((g && g.client_id) || (d && d.client_id));
 }
 const esc = s => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 const extOf = name => (name.includes(".") ? name.split(".").pop().toLowerCase() : "");
@@ -626,6 +676,7 @@ async function folderTree(token, root, cap = 600) {
             level.push(f.id);
         }
     }
+    map.capped = level.length > 0 && map.size >= cap;
     scopeCache.set(root, { map, expires: Date.now() + 300000 });
     return map;
 }
@@ -637,6 +688,7 @@ async function apiList(url, env) {
     const r2 = await r2Find(env, dirs, id);
     if (r2) return r2List(url, env, dirs, r2);
     const token = await tokenOrNull(env);
+    if (!token) return json({ error: "Google Drive is not configured." }, 502);
     const h = url.searchParams.get("hint");
     const hint = h !== null && h !== "" && dirs[+h] ? +h : null;
     let loc = await locate(token, dirs, id, hint);
@@ -647,15 +699,49 @@ async function apiList(url, env) {
     for (const f of d.files || []) if (f.mimeType === FOLDER) rememberMeta(f);
     return json({ disk: loc.disk, crumbs: loc.chain.map(m => ({ id: m.id, name: m.name })), files: (d.files || []).map(shapeOne).filter(Boolean), next: d.nextPageToken || null });
 }
+const corpusExtra = d0 => (d0.type === "shared_drive"
+    ? { corpora: "drive", driveId: d0.id }
+    : d0.type === "folder"
+        ? { corpora: "allDrives" }
+        : { corpora: "user", includeItemsFromAllDrives: "false" });
+async function searchPages(token, q, extra, max, pages) {
+    const out = [];
+    let pt = null;
+    for (let i = 0; i < pages && out.length < max; i++) {
+        const d = await driveList(token, q, pt, { pageSize: "100", ...extra });
+        out.push(...(d.files || []));
+        pt = d.nextPageToken;
+        if (!pt) break;
+    }
+    return out;
+}
+async function searchScoped(token, base, scope, prefix, extra) {
+    const files = await searchPages(token, base, extra, 300, 4);
+    const out = [];
+    for (let i = 0; i < files.length && out.length < 150; i += 20) {
+        const rows = await Promise.all(files.slice(i, i + 20).map(async f => {
+            const s1 = shapeOne(f);
+            if (!s1) return null;
+            const names = await buildPath(token, scope, f);
+            if (!names) return null;
+            s1.path = prefix.concat(names).join("/");
+            return s1;
+        }));
+        for (const r of rows) if (r && out.length < 150) out.push(r);
+    }
+    return out;
+}
 async function apiSearch(url, env) {
     const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
     if (q.length < 2) return json({ files: [] });
-    const [dirs, token] = await Promise.all([getdirs(env), tokenOrNull(env)]);
+    const dirs = await getdirs(env);
     const inId = url.searchParams.get("in") || "";
     const r2s = inId ? await r2Find(env, dirs, inId) : null;
     if (r2s) return r2Search(env, dirs, r2s.disk, r2s.key, q);
     const dq = Number(url.searchParams.get("disk"));
     if (!inId && dirs[dq] && dirs[dq].type === "r2") return r2Search(env, dirs, dq, "", q);
+    const token = await tokenOrNull(env);
+    if (!token) return json({ error: "Google Drive is not configured." }, 502);
     let disk = dq, prefix = [], root = null, scopeName = null;
     if (inId) {
         if (!/^[\w-]{1,2048}$/.test(inId)) return json({ error: "id" }, 400);
@@ -672,51 +758,40 @@ async function apiSearch(url, env) {
     if (!d0) return json({ error: "disk" }, 404);
     if (!scopeName) scopeName = d0.name;
     const base = q.split(/\s+/).slice(0, 5).map(t => `name contains '${esc(t)}'`).join(" and ") + ` and trashed = false and ${VISIBLE}`;
+    const extra = corpusExtra(d0);
+    const top = root || (d0.type === "folder" ? d0.id : null);
     let out = [];
-    if (root || d0.type === "folder") {
-        const top = root || d0.id;
+    if (top) {
         const map = await folderTree(token, top);
-        const ids = [...map.keys()];
-        const extra = { pageSize: "50" };
-        if (d0.type === "shared_drive") { extra.corpora = "drive"; extra.driveId = d0.id; }
-        else if (d0.type === "folder") extra.corpora = "allDrives";
-        else { extra.corpora = "user"; extra.includeItemsFromAllDrives = "false"; }
-        const chunks = [];
-        for (let i = 0; i < ids.length; i += 40) chunks.push(ids.slice(i, i + 40));
-        const res = await Promise.all(chunks.map(ch => driveList(token, base + " and (" + ch.map(i => `'${i}' in parents`).join(" or ") + ")", null, extra)));
-        const seen = new Set();
-        for (const r of res) for (const f of r.files || []) {
-            if (seen.has(f.id)) continue;
-            seen.add(f.id);
-            const s1 = shapeOne(f);
-            if (!s1) continue;
-            const names = [f.name];
-            let p = (f.parents || []).find(x => map.has(x));
-            while (p && p !== top) {
-                const n = map.get(p);
-                if (!n) { p = null; break; }
-                names.unshift(n.name);
-                p = n.parent;
+        if (map.capped) {
+            out = await searchScoped(token, base, top, prefix, extra);
+        } else {
+            const ids = [...map.keys()];
+            const chunks = [];
+            for (let i = 0; i < ids.length; i += 40) chunks.push(ids.slice(i, i + 40));
+            const res = await Promise.all(chunks.map(ch => searchPages(token, base + " and (" + ch.map(i => `'${i}' in parents`).join(" or ") + ")", extra, 100, 2)));
+            const seen = new Set();
+            for (const files of res) for (const f of files) {
+                if (seen.has(f.id)) continue;
+                seen.add(f.id);
+                const s1 = shapeOne(f);
+                if (!s1) continue;
+                const names = [f.name];
+                let p = (f.parents || []).find(x => map.has(x));
+                while (p && p !== top) {
+                    const n = map.get(p);
+                    if (!n) { p = null; break; }
+                    names.unshift(n.name);
+                    p = n.parent;
+                }
+                if (p !== top) continue;
+                s1.path = prefix.concat(names).join("/");
+                out.push(s1);
             }
-            if (p !== top) continue;
-            s1.path = prefix.concat(names).join("/");
-            out.push(s1);
         }
     } else {
-        const extra = { pageSize: "100" };
-        let scope = d0.id;
-        if (d0.type === "shared_drive") { extra.corpora = "drive"; extra.driveId = d0.id; }
-        else { extra.corpora = "user"; extra.includeItemsFromAllDrives = "false"; scope = await getRootId(token); }
-        const d = await driveList(token, base, null, extra);
-        const rows = await Promise.all((d.files || []).map(async f => {
-            const s1 = shapeOne(f);
-            if (!s1) return null;
-            const names = await buildPath(token, scope, f);
-            if (!names) return null;
-            s1.path = names.join("/");
-            return s1;
-        }));
-        out = rows.filter(Boolean);
+        const scope = d0.type === "shared_drive" ? d0.id : await getRootId(token);
+        out = await searchScoped(token, base, scope, prefix, extra);
     }
     out.sort((a, b) => (a.folder === b.folder ? a.name.localeCompare(b.name, undefined, { numeric: true }) : a.folder ? -1 : 1));
     return json({ disk, scope: scopeName, files: out.slice(0, 150) });
@@ -744,6 +819,8 @@ function fileHeaders(f, ext, inline, extra) {
     out.set("Accept-Ranges", "bytes");
     out.set("X-Content-Type-Options", "nosniff");
     out.set("Referrer-Policy", "no-referrer");
+    out.set("Cache-Control", "private, max-age=300");
+    if (f.etag) out.set("ETag", f.etag);
     if (ext === "svg") out.set("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'");
     for (const k in extra) out.set(k, extra[k]);
     return out;
@@ -754,6 +831,7 @@ async function streamFile(request, token, f, inline, extra = {}) {
     if (!ALLOWED[ext]) return page(ERROR_PAGE, 403);
     if (f.r2) {
         const out = fileHeaders(f, ext, inline, extra);
+        if (f.etag && request.headers.get("If-None-Match") === f.etag && !request.headers.get("Range")) return new Response(null, { status: 304, headers: out });
         const size = Number(f.size) || 0;
         const rg = (request.headers.get("Range") || "").match(/^bytes=(\d*)-(\d*)$/);
         let start = 0, end = size - 1, status = 200;
@@ -804,6 +882,7 @@ async function streamFile(request, token, f, inline, extra = {}) {
 async function findFile(token, dirs, id, env) {
     const r2 = await r2Find(env, dirs, id);
     if (r2) return r2File(env, dirs, r2.disk, r2.key);
+    if (!token) return null;
     const f = await locateFile(token, dirs, id);
     if (f) return f;
     const m = await authFetch(token, `${API}/${id}?fields=id,name,mimeType,size,modifiedTime,trashed&supportsAllDrives=true`);
@@ -856,10 +935,6 @@ async function apiUnshare(request, env, me) {
     await env.gdrive.put("shared:" + me, JSON.stringify(list));
     return json({ ok: true });
 }
-async function apiUsers(env, me) {
-    const users = await getUsers(env);
-    return json({ users: users.map(uid).filter(e => e && e !== me) });
-}
 function cleanItems(arr, max) {
     if (!Array.isArray(arr)) return [];
     const out = [], seen = new Set();
@@ -894,7 +969,7 @@ async function handleShare(request, env, tok, kind) {
     const token = await tokenOrNull(env);
     const dirs = await getdirs(env);
     const r2 = await r2Find(env, dirs, s.id);
-    const f = r2 ? await r2File(env, dirs, r2.disk, r2.key) : await getMeta(token, s.id);
+    const f = r2 ? await r2File(env, dirs, r2.disk, r2.key) : (token ? await getMeta(token, s.id) : null);
     if (!f) return json({ error: "File not found." }, 404, hdr);
     if (kind === "info") return json({ name: f.name, size: Number(f.size) || 0, modified: f.modifiedTime }, 200, hdr);
     return streamFile(request, token, f, kind === "raw", hdr);
@@ -907,7 +982,8 @@ async function apiManageGet(env, me) {
         me: me.name,
         canEdit: me.allowedit,
         config: await getConfig(env),
-        dirs: dirs.map(d => ({ id: d.id, name: d.name, type: d.type || "root", protect: !!d.protect_file_link })),
+        storage: me.allowedit ? { mode: await getMode(env, dirs), creds: await hasCreds(env), r2: r2Bindings(env) } : null,
+        dirs: dirs.map(d => ({ id: me.allowedit ? d.id : "", name: d.name, type: d.type || "root", protect: !!d.protect_file_link })),
         users: list.map(u => ({ email: uid(u), allowedit: canEditU(u) })),
     });
 }
@@ -937,6 +1013,31 @@ async function apiManagePost(request, env, url, me) {
         if (!c) return json({ error: "Enter a project name and a valid http(s) favicon URL." }, 400);
         await env.gdrive.put("config", JSON.stringify(c));
         cfgCache = { value: null, expires: 0 };
+        return json({ ok: true });
+    }
+
+    if (sub === "storage") {
+        const mode = ["drive", "r2", "both"].includes(b.mode) ? b.mode : null;
+        if (!mode) return json({ error: "Choose a storage mode." }, 400);
+        const list = await env.gdrive.get("dirs", "json");
+        if (!Array.isArray(list)) throw new Error("dirs");
+        if (mode === "r2" && list.some(d => d.type !== "r2")) return json({ error: "Remove the Google Drive locations first." }, 400);
+        if (mode === "drive" && list.some(d => d.type === "r2")) return json({ error: "Remove the R2 locations first." }, 400);
+        if (mode !== "r2") {
+            const c = b.creds || {};
+            const creds = { client_id: String(c.client_id || "").trim(), client_secret: String(c.client_secret || "").trim(), refresh_token: String(c.refresh_token || "").trim() };
+            if (creds.client_id || creds.client_secret || creds.refresh_token) {
+                if (!creds.client_id || !creds.client_secret || !creds.refresh_token) return json({ error: "Enter the client ID, client secret and refresh token." }, 400);
+                const x = await exchangeToken(creds);
+                if (x.net) return json({ error: "Could not reach Google to verify the credentials." }, 502);
+                if (!x.token) return json({ error: "Google rejected these credentials." }, 400);
+                await env.gdrive.put("drive_token", JSON.stringify(creds));
+                try { await env.gdrive.delete("drive_access"); } catch (e) { }
+            } else if (!(await hasCreds(env))) return json({ error: "Enter the Google credentials to use Google Drive." }, 400);
+        }
+        await env.gdrive.put("storage", JSON.stringify({ mode }));
+        usageCache = { value: null, expires: 0 };
+        tokenCache = { value: null, expires: 0 };
         return json({ ok: true });
     }
 
@@ -972,14 +1073,33 @@ async function apiManagePost(request, env, url, me) {
         if (!Array.isArray(list)) throw new Error("dirs");
         const d = b.dir || {};
         const name = String(d.name || "").trim().slice(0, 60);
-        const type = ["root", "folder", "shared_drive", "my_drive"].includes(d.type) ? d.type : String(d.type || "folder").slice(0, 30);
+        let type = d.type === "my_drive" ? "root" : String(d.type || "folder");
         let id = String(d.id || "").trim();
-        if (!id && (type === "root" || type === "my_drive")) id = "root";
+        if (type === "root") id = "root";
         const i = Number(b.index);
         if (b.action === "add" || b.action === "update") {
             if (!name) return json({ error: "Enter a name." }, 400);
-            if (!/^[\w-]{1,100}$/.test(id)) return json({ error: "Enter a valid Google Drive ID." }, 400);
-            if (type === "r2" && !(env[id] && typeof env[id].list === "function")) return json({ error: "No R2 bucket is bound to this Worker as “" + id + "”." }, 400);
+            if (!SETUP_TYPES.includes(type)) return json({ error: "Choose a valid type." }, 400);
+            const mode = await getMode(env, list);
+            if (type === "r2") {
+                if (mode === "drive") return json({ error: "Switch the storage mode to R2 or Both first." }, 400);
+                if (!/^[A-Za-z_]\w{0,62}$/.test(id)) return json({ error: "Enter a valid R2 binding name." }, 400);
+                if (!isR2(env[id])) return json({ error: "No R2 bucket is bound to this Worker as “" + id + "”." }, 400);
+            } else {
+                if (mode === "r2") return json({ error: "Switch the storage mode to Drive or Both first." }, 400);
+                if (type !== "root") {
+                    if (!/^[\w-]{10,100}$/.test(id)) return json({ error: "Enter a valid Google Drive ID." }, 400);
+                    const token = await tokenOrNull(env);
+                    if (!token) return json({ error: "Google credentials are not configured." }, 400);
+                    if (type === "shared_drive") {
+                        if (!(await authFetch(token, `https://www.googleapis.com/drive/v3/drives/${id}?fields=id`))) return json({ error: "Shared drive not found or not accessible." }, 400);
+                    } else {
+                        const m = await authFetch(token, `${API}/${id}?fields=id,mimeType&supportsAllDrives=true`);
+                        if (!m) return json({ error: "Folder not found or not accessible." }, 400);
+                        if (m.mimeType !== FOLDER) return json({ error: "This ID is not a folder." }, 400);
+                    }
+                }
+            }
             const rec = { id, name, type, protect_file_link: !!d.protect };
             if (b.action === "add") list.push(rec);
             else {
@@ -993,6 +1113,7 @@ async function apiManagePost(request, env, url, me) {
         } else return json({ error: "Bad request" }, 400);
         await env.gdrive.put("dirs", JSON.stringify(list));
         dirsCache = { value: null, expires: 0 };
+        usageCache = { value: null, expires: 0 };
         scopeCache.clear(); folderCache.clear(); fileCache.clear(); okCache.clear();
         return json({ ok: true });
     }
@@ -1004,10 +1125,10 @@ async function kvJson(env, key) {
     try { return await env.gdrive.get(key, "json"); } catch (e) { return null; }
 }
 async function setupStatus(env) {
-    if (!env.gdrive) return { bound: false, missing: { creds: true, dirs: true, users: true } };
+    if (!env.gdrive) return { bound: false, r2: r2Bindings(env), missing: { creds: true, dirs: true, users: true } };
     const [g, d, u, a, sg] = await Promise.all([kvJson(env, "gdrive_json"), kvJson(env, "drive_token"), kvJson(env, "users"), kvJson(env, "dirs"), kvJson(env, "storage")]);
     const ok = c => !!(c && c.client_id);
-    return { bound: true, missing: { creds: !(sg && sg.mode === "r2") && !(ok(g) || ok(d)), dirs: !(Array.isArray(a) && a.length), users: !(Array.isArray(u) && u.length) } };
+    return { bound: true, r2: r2Bindings(env), missing: { creds: !(sg && sg.mode === "r2") && !(ok(g) || ok(d)), dirs: !(Array.isArray(a) && a.length), users: !(Array.isArray(u) && u.length) } };
 }
 async function needsSetup(env) {
     if (isDone()) return false;
@@ -1029,13 +1150,11 @@ async function setupFinish(request, env, url, st, hdr) {
         const client_secret = String(c.client_secret || "").trim();
         const refresh_token = String(c.refresh_token || "").trim();
         if (!client_id || !client_secret || !refresh_token) return json({ error: "Enter the client ID, client secret and refresh token." }, 400, hdr);
-        let res;
-        try {
-            res = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id, client_secret, refresh_token, grant_type: "refresh_token" }) });
-        } catch (e) { return json({ error: "Could not reach Google to verify the credentials." }, 502, hdr); }
-        if (!res.ok) return json({ error: "Google rejected these credentials. Check the client ID, secret and refresh token." }, 400, hdr);
-        token = (await res.json()).access_token;
         creds = { client_id, client_secret, refresh_token };
+        const x = await exchangeToken(creds);
+        if (x.net) return json({ error: "Could not reach Google to verify the credentials." }, 502, hdr);
+        if (!x.token) return json({ error: "Google rejected these credentials. Check the client ID, secret and refresh token." }, 400, hdr);
+        token = x.token;
     }
     if (st.missing.users) {
         const a = b.admin || {};
@@ -1059,7 +1178,7 @@ async function setupFinish(request, env, url, st, hdr) {
             if (!name) return json({ error: "Every location needs a name." }, 400, hdr);
             if (type === "r2") {
                 if (!/^[A-Za-z_]\w{0,62}$/.test(id)) return json({ error: "Invalid R2 binding name for “" + name + "”." }, 400, hdr);
-                if (!(env[id] && typeof env[id].list === "function")) return json({ error: "“" + name + "”: no R2 bucket is bound to this Worker as “" + id + "”." }, 400, hdr);
+                if (!isR2(env[id])) return json({ error: "“" + name + "”: no R2 bucket is bound to this Worker as “" + id + "”." }, 400, hdr);
             } else if (type !== "root" && !/^[\w-]{10,100}$/.test(id)) return json({ error: "Invalid Drive ID for “" + name + "”." }, 400, hdr);
             dirs.push({ id, name, type });
         }
@@ -1178,6 +1297,7 @@ async function handle(request, env) {
             if (!rf) return page(ERROR_PAGE, 404);
             return streamFile(request, token, rf, url.searchParams.get("inline") === "1");
         }
+        if (!token) return page(ERROR_PAGE, 404);
         const file = await lookupFile(token, dirs, order, segments);
         if (!file) return page(ERROR_PAGE, 404);
         return streamFile(request, token, file, url.searchParams.get("inline") === "1");
@@ -1219,7 +1339,6 @@ export default {
         try {
             return await handle(request, env || {});
         } catch (e) {
-            console.error(e && e.stack ? e.stack : String(e));
             let p = "";
             try { p = new URL(request.url).pathname; } catch (x) { p = ""; }
             if (p.startsWith("/api/")) {
@@ -1231,6 +1350,31 @@ export default {
         }
     },
 };
+
+const PDFJS = String.raw`
+function renderPdf(box,url){
+  var B='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  var load=function(src){return new Promise(function(ok,no){var s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=no;document.head.appendChild(s)})};
+  box.style.overflow='auto';box.style.display='flex';box.style.flexDirection='column';box.style.alignItems='center';box.style.gap='8px';box.style.padding='8px';box.style.boxSizing='border-box';
+  box.innerHTML='<div style="margin:auto;opacity:.7">Loading…</div>';
+  var ready=window.pdfjsLib&&window.pdfjsLib.GlobalWorkerOptions.workerSrc?Promise.resolve():load(B+'pdf.min.js').then(function(){return fetch(B+'pdf.worker.min.js')}).then(function(r){return r.text()}).then(function(t){window.pdfjsLib.GlobalWorkerOptions.workerSrc=URL.createObjectURL(new Blob([t],{type:'text/javascript'}))});
+  return ready.then(function(){return window.pdfjsLib.getDocument({url:url,withCredentials:true}).promise}).then(function(doc){
+    box.innerHTML='';
+    var w=Math.min((box.clientWidth||600)-16,1000),dpr=window.devicePixelRatio||1;
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){
+      if(!e.isIntersecting||e.target._d)return;
+      e.target._d=1;
+      doc.getPage(+e.target.dataset.n).then(function(pg){
+        var v1=pg.getViewport({scale:1}),sc=w/v1.width,v=pg.getViewport({scale:sc*dpr}),c=document.createElement('canvas');
+        c.width=v.width;c.height=v.height;c.style.width=w+'px';c.style.height=(v.height/dpr)+'px';
+        e.target.style.height='auto';e.target.innerHTML='';e.target.appendChild(c);
+        pg.render({canvasContext:c.getContext('2d'),viewport:v});
+      });
+    })},{root:box,rootMargin:'800px'});
+    for(var i=1;i<=doc.numPages;i++){var d=document.createElement('div');d.dataset.n=i;d.style.cssText='width:'+w+'px;height:'+Math.round(w*1.414)+'px;background:#fff;flex-shrink:0';box.appendChild(d);io.observe(d)}
+  }).catch(function(){box.innerHTML='<iframe src="'+url+'" style="width:100%;height:100%;border:0;background:#fff"></iframe>'});
+}
+`;
 
 const SETUP_PAGE = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow">
@@ -1283,6 +1427,7 @@ input:disabled{opacity:.55}select option{background:var(--sv);color:var(--fg)}
 .sum{border:1px solid var(--ol);border-radius:16px;overflow:hidden}
 .sum div{padding:12px 16px;font-size:14px;display:flex;justify-content:space-between;gap:14px}.sum div+div{border-top:1px solid var(--ol)}
 .sum span{color:var(--ov);flex-shrink:0}.sum b{font-weight:500;text-align:right;word-break:break-all}
+.sum i{font-style:normal;margin-left:4px}.sum .ok{color:var(--ok)}.sum .bad{color:var(--er)}
 .radios{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}.rad{display:flex;align-items:center;gap:8px;padding:10px 16px;border:1px solid var(--ol);border-radius:14px;cursor:pointer;font-size:14px}.rad input{accent-color:var(--pr);width:18px;height:18px;margin:0}
 .done{text-align:center;padding:12px 0}
 .done .big{width:84px;height:84px;margin:0 auto 18px;border-radius:50%;background:var(--ok);color:#fff;display:grid;place-items:center;font-size:44px}
@@ -1301,7 +1446,7 @@ var NAMES=['Welcome','KV','Name','Admin','Storage','Finish'];
 var TYPES=[['root','Root (My Drive)'],['folder','Folder'],['shared_drive','Shared drive'],['r2','R2 bucket']];
 var EMAIL=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 var MODES=[['drive','Google Drive only'],['r2','R2 bucket only'],['both','Both']];
-var S={mode:'drive',step:1,read:false,ack:false,bound:null,closed:false,checking:false,missing:{creds:true,dirs:true,users:true},cfg:{name:'Drive',favicon:''},admin:{email:'',pw:'',pw2:''},creds:{client_id:'',client_secret:'',refresh_token:''},dirs:[{name:'',id:'',type:'folder'}],err:'',busy:false,done:false};
+var S={mode:'drive',step:1,read:false,ack:false,bound:null,closed:false,checking:false,r2:[],missing:{creds:true,dirs:true,users:true},cfg:{name:'Drive',favicon:''},admin:{email:'',pw:'',pw2:''},creds:{client_id:'',client_secret:'',refresh_token:''},dirs:[{name:'',id:'',type:'folder'}],err:'',busy:false,done:false};
 
 function stepsV(){
   $('#steps').innerHTML=NAMES.map(function(n,i){var k=i+1,c=S.done||k<S.step?'ok':k===S.step?'on':'';return '<li class="'+c+'"><i>'+(c==='ok'?'✓':k)+'</i>'+n+'</li>'}).join('');
@@ -1315,10 +1460,10 @@ function field(id,label,type,val,f,extra){return '<div class="f"><label for="'+i
 function v1(){
   return '<h2>Welcome</h2><p class="sub">Let’s get your Drive up and running. Please read the information below.</p>'+
   '<div class="tos" id="tos">'+
-  '<h3>About this project</h3><p>Drive is a self-hosted web file browser for Google Drive that runs on a Cloudflare Worker. It lets signed-in users browse folders, preview images, video, audio, PDF and text, search, star files and create expiring share links.</p>'+
-  '<h3>What this setup does</h3><p>The guided setup writes up to five keys to a Workers KV namespace and nothing else. It never changes anything inside your Google Drive.</p>'+
-  '<ul><li><code>drive_token</code> – your Google OAuth client ID, client secret and refresh token</li><li><code>dirs</code> – the locations (root, folders or shared drives) you want to expose</li><li><code>users</code> – the accounts that may sign in; the first one is an administrator</li><li><code>config</code> – the project name and optional favicon URL</li><li><code>storage</code> – whether you use Google Drive, R2 or both</li></ul>'+
-  '<h3>Before you start</h3><ol><li>A Google OAuth client ID, client secret and a refresh token that grants read access to Drive.</li><li>The IDs of the folders or shared drives you want to show (or use the root of the Drive).</li><li>A Workers KV namespace bound to this Worker, as described next.</li></ol>'+
+  '<h3>About this project</h3><p>Drive is a self-hosted web file browser for Google Drive and Cloudflare R2 that runs on a Cloudflare Worker. It lets signed-in users browse folders, preview images, video, audio, PDF and text, search, star files and create expiring share links.</p>'+
+  '<h3>What this setup does</h3><p>The guided setup writes up to five keys to a Workers KV namespace and nothing else. It never changes anything inside your Google Drive or R2 buckets.</p>'+
+  '<ul><li><code>drive_token</code> – your Google OAuth client ID, client secret and refresh token</li><li><code>dirs</code> – the locations (root, folders, shared drives or R2 buckets) you want to expose</li><li><code>users</code> – the accounts that may sign in; the first one is an administrator</li><li><code>config</code> – the project name and optional favicon URL</li><li><code>storage</code> – whether you use Google Drive, R2 or both</li></ul>'+
+  '<h3>Before you start</h3><ol><li>For Google Drive: an OAuth client ID, client secret and a refresh token that grants read access to Drive.</li><li>For R2: one or more R2 buckets bound to this Worker.</li><li>The IDs of the folders or shared drives you want to show (or use the root of the Drive).</li><li>A Workers KV namespace bound to this Worker, as described next.</li></ol>'+
   '<h3>Add and bind the KV namespace</h3><ol><li>Open the Cloudflare dashboard → <b>Workers &amp; Pages</b> → select this Worker.</li><li>Go to <b>Settings → Bindings → Add → KV namespace</b>.</li><li>Set the variable name to exactly <code>gdrive</code>.</li><li>Pick an existing namespace or create a new one, then save and deploy.</li></ol>'+
   '<h3>Security notes</h3><ul><li>Passwords are stored in KV exactly as entered. Restrict access to your KV namespace and Cloudflare account.</li><li>This setup page is only available while the keys <code>drive_token</code>, <code>dirs</code> and <code>users</code> are missing. Once they exist, <code>/setup</code> disappears.</li><li>Anyone who can reach this page on a fresh deployment can configure it, so finish setup right after deploying.</li></ul>'+
   '<h3>Acknowledgement</h3><p>By continuing you confirm that you have read this information and that you will bind a KV namespace named <code>gdrive</code> to this Worker.</p>'+
@@ -1331,7 +1476,7 @@ function v2(){
   var h='<h2>Check storage</h2><p class="sub">We look for a KV namespace bound to this Worker as <code>gdrive</code>.</p>';
   if(S.closed)return '<div class="stat ok">Setup is already complete.</div>'+'<div class="nav"><span></span><a class="btn" href="/">Open Drive</a></div>';
   if(S.checking||S.bound===null)h+='<div class="stat"><span class="spin"></span>Checking…</div>';
-  else if(S.bound)h+='<div class="stat ok">✓ KV namespace <code>gdrive</code> is bound</div><div class="list">'+row('Google credentials','drive_token',!S.missing.creds)+row('Locations','dirs',!S.missing.dirs)+row('Users','users',!S.missing.users)+'</div>';
+  else if(S.bound)h+='<div class="stat ok">✓ KV namespace <code>gdrive</code> is bound</div><div class="list">'+row('Google credentials','drive_token',!S.missing.creds)+row('Locations','dirs',!S.missing.dirs)+row('Users','users',!S.missing.users)+'<div><b>R2 bindings</b><span class="'+(S.r2.length?'yes':'no')+'">'+(S.r2.length?'✓ '+E(S.r2.join(', ')):'None detected')+'</span></div></div>';
   else h+='<div class="stat bad">✕ No KV binding named <code>gdrive</code> was found</div><ol class="how"><li>Cloudflare dashboard → <b>Workers &amp; Pages</b> → this Worker.</li><li><b>Settings → Bindings → Add → KV namespace</b>.</li><li>Variable name: <code>gdrive</code>, choose a namespace, save and deploy.</li><li>Come back and press <b>Check again</b>.</li></ol><button class="btn sec" data-a="recheck">Check again</button>';
   return h+nav(true,'Next →','next',!S.bound||S.checking);
 }
@@ -1357,7 +1502,7 @@ function v4(){
   var h='<h2>Connect storage</h2>';
   if(!S.missing.creds&&!S.missing.dirs)return h+'<p class="sub">Credentials and locations already exist, so there is nothing to do here.</p>'+nav(true,'Next →','next');
   h+='<p class="sub">Choose what you want to connect, then add your locations.</p><div class="radios">'+MODES.map(function(x){return '<label class="rad"><input type="radio" name="mode" value="'+x[0]+'"'+(S.mode===x[0]?' checked':'')+'>'+x[1]+'</label>'}).join('')+'</div>';
-  if(S.mode!=='drive')h+='<p class="hint" style="margin:0 2px 10px">For R2, bind each bucket to this Worker (Settings → Bindings → R2 bucket), then enter its binding name (for example <code>drive1</code>) as the ID.</p>';
+  if(S.mode!=='drive')h+='<p class="hint" style="margin:0 2px 10px">For R2, bind each bucket to this Worker (Settings → Bindings → R2 bucket), then enter its binding name (for example <code>drive1</code>) as the ID. Detected bindings: '+(S.r2.length?'<code>'+E(S.r2.join('</code>, <code>').replace(/&lt;/g,'<'))+'</code>':'none')+'.</p>';
   if(needCreds())h+='<div class="sec-t">Google credentials</div>'+field('c1','Client ID','text',S.creds.client_id,'creds.client_id')+field('c2','Client secret','password',S.creds.client_secret,'creds.client_secret')+field('c3','Refresh token','password',S.creds.refresh_token,'creds.refresh_token');
   if(S.missing.dirs)h+='<div class="sec-t">Locations</div>'+S.dirs.map(dirRow).join('')+'<button class="btn sec" data-a="adddir" '+(S.dirs.length>=20?'disabled':'')+'>+ Add location</button>';
   return h+errV()+nav(true,'Next →','next');
@@ -1365,11 +1510,19 @@ function v4(){
 function v5(){
   if(S.done)return '<div class="done"><div class="big">✓</div><h2>Setup complete</h2><p class="sub">Your Drive is ready. Sign in with the administrator account you just created. Changes can take up to a minute to reach every Cloudflare location.</p><a class="btn" href="/">Open Drive</a></div>';
   var r='<div><span>Project name</span><b>'+E(S.cfg.name.trim())+'</b></div>';
+  r+='<div><span>KV namespace</span><b>gdrive<i class="ok">✓ bound</i></b></div>';
   if(S.missing.users)r+='<div><span>Administrator</span><b>'+E(S.admin.email.trim().toLowerCase())+'</b></div>';
-  r+='<div><span>Storage</span><b>'+E(MODES.filter(function(m){return m[0]===S.mode})[0][1])+'</b></div>';
-  if(needCreds())r+='<div><span>Google client ID</span><b>'+E(S.creds.client_id.trim().slice(0,12))+'…</b></div>';
-  if(S.missing.dirs)S.dirs.forEach(function(d){r+='<div><span>'+E(d.name.trim())+'</span><b>'+E((TYPES.filter(function(t){return t[0]===d.type})[0]||[0,d.type])[1])+'</b></div>'});
-  return '<h2>Finish setup</h2><p class="sub">Review and finish. We verify the Google credentials and each location before saving anything.</p>'+(r?'<div class="sum">'+r+'</div>':'')+errV()+
+  r+='<div><span>Storage mode</span><b>'+E(MODES.filter(function(m){return m[0]===S.mode})[0][1])+'</b></div>';
+  if(S.mode!=='r2')r+='<div><span>Google credentials</span><b>'+(needCreds()?E(S.creds.client_id.trim().slice(0,12))+'…<i class="ok">✓ to be verified</i>':'already saved<i class="ok">✓</i>')+'</b></div>';
+  if(S.mode!=='drive')r+='<div><span>R2 bindings</span><b>'+(S.r2.length?E(S.r2.join(', ')):'none detected')+'</b></div>';
+  if(S.missing.dirs)S.dirs.forEach(function(d){
+    var t=(TYPES.filter(function(x){return x[0]===d.type})[0]||[0,d.type])[1],x;
+    if(d.type==='r2'){var f=S.r2.indexOf(d.id.trim())>=0;x=E(t)+' · '+E(d.id.trim())+'<i class="'+(f?'ok':'bad')+'">'+(f?'✓ bound':'✕ not bound')+'</i>'}
+    else x=E(t)+(d.type==='root'?'':' · '+E(d.id.trim().slice(0,10))+'…');
+    r+='<div><span>'+E(d.name.trim())+'</span><b>'+x+'</b></div>';
+  });
+  else r+='<div><span>Locations</span><b>already configured<i class="ok">✓</i></b></div>';
+  return '<h2>Finish setup</h2><p class="sub">Review and finish. We verify the Google credentials and each location before saving anything.</p><div class="sum">'+r+'</div>'+errV()+
    '<div class="nav"><button class="btn sec" data-a="back"'+(S.busy?' disabled':'')+'>Back</button><button class="btn" data-a="finish"'+(S.busy?' disabled':'')+'>'+(S.busy?'Verifying…':'Finish setup')+'</button></div>';
 }
 function draw(){
@@ -1386,7 +1539,7 @@ function check(){
   S.checking=true;draw();
   return fetch('/setup/api/status',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
     S.checking=false;
-    if(j.bound===undefined){S.closed=true;S.bound=false}else{S.bound=j.bound;S.missing=j.missing}
+    if(j.bound===undefined){S.closed=true;S.bound=false}else{S.bound=j.bound;S.missing=j.missing;S.r2=j.r2||[]}
     draw();
   }).catch(function(){S.checking=false;S.bound=false;draw()});
 }
@@ -1409,7 +1562,10 @@ function validate(){
       for(var i=0;i<S.dirs.length;i++){
         var d=S.dirs[i];
         if(!d.name.trim())return 'Every location needs a name.';
-        if(d.type==='r2'){if(!/^[A-Za-z_]\w*$/.test(d.id.trim()))return 'Enter the R2 binding name for “'+d.name.trim()+'”.'}
+        if(d.type==='r2'){
+          if(!/^[A-Za-z_]\w*$/.test(d.id.trim()))return 'Enter the R2 binding name for “'+d.name.trim()+'”.';
+          if(S.r2.length&&S.r2.indexOf(d.id.trim())<0)return 'No R2 binding named “'+d.id.trim()+'” was detected. Bind it first (Settings → Bindings → R2 bucket).';
+        }
         else if(d.type!=='root'&&!/^[\w-]{10,100}$/.test(d.id.trim()))return 'Enter a valid Drive ID for “'+d.name.trim()+'”.';
       }
     }
@@ -1488,6 +1644,7 @@ pre{margin:0;padding:20px;width:100%;height:100%;overflow:auto;font:13px/1.6 ui-
 <main id="m"><div class="sub">Loading…</div></main>
 <script>
 (function(){
+__PDFJS__
 var tok=location.pathname.split('/')[2],base='/share/'+tok;
 var K={image:'jpg jpeg png gif webp avif bmp svg ico',video:'mp4 m4v webm mov',audio:'mp3 m4a aac ogg opus wav flac',pdf:'pdf'};
 var T='txt md csv tsv json log srt ass lrc xml yml yaml ini toml conf cfg properties nfo diff patch html htm css scss less js mjs ts jsx tsx py java kt c h cpp hpp cs go rs php rb sh bat ps1 sql lua swift gradle tex r dart vue svelte';
@@ -1501,7 +1658,7 @@ fetch(base+'/info').then(function(r){return r.json().then(function(j){if(!r.ok)t
   if(k==='image')m.innerHTML='<img src="'+u+'" alt="">';
   else if(k==='video')m.innerHTML='<video src="'+u+'" controls autoplay playsinline></video>';
   else if(k==='audio')m.innerHTML='<audio src="'+u+'" controls autoplay></audio>';
-  else if(k==='pdf')m.innerHTML='<iframe src="'+u+'"></iframe>';
+  else if(k==='pdf'){m.innerHTML='<div id="pb" style="width:100%;height:100%"></div>';renderPdf(document.getElementById('pb'),u)}
   else if(k==='text'){m.innerHTML='<pre></pre>';fetch(u,{headers:{Range:'bytes=0-1048575'}}).then(function(r){return r.text()}).then(function(t){m.firstChild.textContent=t})}
   else m.innerHTML='<div class="card"><span class="ms">draft</span><div style="font-size:20px;font-weight:500;word-break:break-all;margin-top:12px">'+f.name.replace(/[<>&]/g,'')+'</div><div class="sub">'+sz(f.size)+' · No preview available</div></div>';
 }).catch(function(e){m.innerHTML='<div class="card"><span class="ms">link_off</span><div class="sub">'+(e.message||'Unavailable')+'</div></div>'});
@@ -1647,13 +1804,15 @@ input[type=range]{accent-color:var(--m-primary);height:28px;cursor:pointer;width
 <script>
 (function(){
 'use strict';
+__PDFJS__
 var NAME=__NAME_JSON__;
 var $=function(s){return document.querySelector(s)};
 var E=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
 var ic=function(n,c){return '<span class="'+(n==='cloud'?'mso':'ms')+' '+(c||'')+'">'+n+'</span>'};
+var val=function(id){var e=$('#'+id);return e?e.value:''};
 var LS={get:function(k,d){try{var v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},set:function(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
 var cfg=Object.assign({theme:'auto',hue:230,view:'grid',info:false},LS.get('cfg',{}));
-var S={me:null,dirs:[],r:{t:'home'},items:[],vis:[],next:null,loading:false,err:null,tok:0,filter:'all',sort:{k:'name',d:1},stars:[],recent:[],shared:[],allUsers:[],u:0,accts:[],usage:null,adding:false,vw:null,pl:[],rate:1,fns:[],disk:0,hint:null,crumbs:[],sel:new Set(),anchor:null,shDays:7,shMode:'people',shTo:[],txt:'',lstep:1,lemail:'',mg:null,udT:{},udDirty:{},udAt:0};
+var S={me:null,dirs:[],r:{t:'home'},items:[],vis:[],next:null,loading:false,err:null,tok:0,filter:'all',sort:{k:'name',d:1},stars:[],recent:[],shared:[],u:0,accts:[],usage:null,adding:false,vw:null,pl:[],rate:1,fns:[],disk:0,hint:null,crumbs:[],sel:new Set(),anchor:null,shDays:7,shMode:'people',shTo:[],txt:'',lstep:1,lemail:'',mg:null,udT:{},udDirty:{},udAt:0};
 var LP={t:null,fired:false,x:0,y:0};
 var EMAIL=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -1707,7 +1866,7 @@ function setAccount(u){
   S.u=u;S.me=S.accts[u];
   S.stars=uniq(LS.get('stars:'+S.me,u===0?LS.get('stars',[]):[]));
   S.recent=uniq(LS.get('recent:'+S.me,u===0?LS.get('recent',[]):[]));
-  S.shared=[];S.allUsers=[];
+  S.shared=[];
   var a=$('#avatar');if(a)a.textContent=S.me.charAt(0).toUpperCase();
   setTimeout(pullUD,0);
 }
@@ -1813,8 +1972,13 @@ function seg(a,opts,cur){
 }
 function storageV(full){
   var u=S.usage;if(!u)return '';
-  var q=function(n){return n?sz(n):'0 B'},pct=u.limit?Math.min(100,u.usage/u.limit*100):0,bad=pct>=90,other=Math.max(0,u.usage-u.drive);
-  return '<div class="h-2 rounded-full bg-surface-highest overflow-hidden"><div class="h-full rounded-full '+(bad?'bg-error':'bg-primary')+'" style="width:'+(u.limit?Math.max(pct,u.usage?2:0):100)+'%"></div></div><div class="text-sm mt-2">'+q(u.usage)+(u.limit?' of '+q(u.limit):'')+' used</div>'+(full?'<div class="text-xs text-on-surface-variant mt-1">Drive '+q(u.drive)+' · Trash '+q(u.trash)+' · Other '+q(other)+'</div>':'');
+  var q=function(n){return n?sz(n):'0 B'},dr=u.limit>0||u.usage>0,r2=u.r2!=null&&(u.r2>0||!dr),h='';
+  if(dr){
+    var pct=u.limit?Math.min(100,u.usage/u.limit*100):0,bad=pct>=90,other=Math.max(0,u.usage-u.drive);
+    h+='<div class="h-2 rounded-full bg-surface-highest overflow-hidden"><div class="h-full rounded-full '+(bad?'bg-error':'bg-primary')+'" style="width:'+(u.limit?Math.max(pct,u.usage?2:0):100)+'%"></div></div><div class="text-sm mt-2">'+q(u.usage)+(u.limit?' of '+q(u.limit):'')+' used</div>'+(full?'<div class="text-xs text-on-surface-variant mt-1">Drive '+q(u.drive)+' · Trash '+q(u.trash)+' · Other '+q(other)+'</div>':'');
+  }
+  if(r2)h+='<div class="text-sm '+(dr?'mt-3':'')+'">R2 · '+q(u.r2)+(u.approx?'+':'')+' used</div>';
+  return h;
 }
 function profileV(){
   var hues=[230,175,330,25,285,140].map(function(h){return '<button data-a="hue" data-x="'+h+'" class="w-10 h-10 rounded-full morph grid place-items-center" style="background:hsl('+h+' 60% 50%)">'+(cfg.hue===h?'<span class="ms sm text-white">check</span>':'')+'</button>'}).join('');
@@ -1837,7 +2001,7 @@ function profileV(){
 
 function mgLoad(){
   dialog('<div class="py-10 grid place-items-center"><div class="loader"></div></div>',true);
-  api('/api/manage').then(function(d){S.mg={d:d,tab:'users',form:null};mgDraw()}).catch(function(e){
+  api('/api/manage').then(function(d){S.mg={d:d,tab:'users',form:null,mode:null,tmp:null};mgDraw()}).catch(function(e){
     dialog('<div class="text-error">'+E(e.message)+'</div><div class="flex justify-end mt-6"><button data-a="closedlg" class="h-10 px-6 rounded-full bg-primary text-on-primary font-medium state morph">Close</button></div>');
   });
 }
@@ -1855,7 +2019,7 @@ function mgFormV(){
       h=mgField('mg-email','Email',f.email,'email',f.mode==='edit'?'readonly':'')+mgField('mg-pw',f.mode==='add'?'Password':'New password (leave blank to keep)','','password')+mgCheck('mg-ed','Allow editing users and locations',f.allowedit,self);
     }
   }else{
-    var d=f.dir,types=Object.keys(DT);
+    var d=f.dir,sm=m.d.storage?m.d.storage.mode:'both',types=Object.keys(DT).filter(function(t){return sm==='both'||(sm==='r2')===(t==='r2')});
     if(types.indexOf(d.type)<0)types.push(d.type);
     title=f.mode==='add'?'Add location':'Edit location';
     h=mgField('mg-name','Name',d.name)+mgField('mg-id','Drive ID / R2 binding name',d.id)+'<div class="tf"><select id="mg-type">'+types.map(function(t){return '<option value="'+E(t)+'"'+(t===d.type?' selected':'')+'>'+E(DT[t]||t)+'</option>'}).join('')+'</select><label>Type</label></div>'+mgCheck('mg-pr','Protect direct file links (signed-in users only)',d.protect);
@@ -1866,8 +2030,13 @@ function mgListV(){
   var m=S.mg,d=m.d,h='';
   var ib=function(a,i,icon,t){return '<button data-a="'+a+'" data-i="'+i+'" title="'+t+'" class="ib state">'+ic(icon,'sm')+'</button>'};
   if(m.tab==='cfg'){
-    h+=mgField('mg-cname','Project name',d.config.name)+mgField('mg-cfav','Favicon URL (optional)',d.config.favicon)+
-     '<button data-a="mgcfg" class="state morph h-11 px-6 rounded-full bg-primary text-on-primary text-sm font-medium">Save</button>';
+    var sm=m.mode||d.storage.mode,tp=m.tmp||{};
+    h+=mgField('mg-cname','Project name',tp.name!=null?tp.name:d.config.name)+mgField('mg-cfav','Favicon URL (optional)',tp.fav!=null?tp.fav:d.config.favicon)+
+     '<button data-a="mgcfg" class="state morph h-11 px-6 rounded-full bg-primary text-on-primary text-sm font-medium">Save</button>'+
+     '<div class="text-sm font-medium mt-8 mb-3">Storage mode</div>'+seg('mgmode',[['drive','Drive','cloud'],['r2','R2','database'],['both','Both','storage']],sm);
+    if(sm!=='drive')h+='<div class="text-xs text-on-surface-variant mt-3">R2 bindings detected: '+(d.storage.r2.length?E(d.storage.r2.join(', ')):'none')+'</div>';
+    if(sm!=='r2')h+='<div class="mt-5">'+mgField('mg-cid','Client ID'+(d.storage.creds?' (blank to keep saved)':''),tp.cid)+mgField('mg-csec','Client secret',tp.csec,'password')+mgField('mg-crt','Refresh token',tp.crt,'password')+'</div>';
+    h+='<button data-a="mgstorage" class="state morph mt-2 h-11 px-6 rounded-full bg-secondary-container text-on-secondary-container text-sm font-medium">Apply storage mode</button>';
   }else if(m.tab==='users'){
     h+=d.users.map(function(u,i){
       var self=u.email===d.me;
@@ -1894,20 +2063,21 @@ function mgDraw(){
 function mgErr(msg){var e=$('#mgerr');if(e)e.textContent=msg}
 function mgRun(url,body,after){
   return post(url,body).then(function(){return api('/api/manage')}).then(function(d){
-    if(!S.mg)return;S.mg.d=d;S.mg.form=null;mgDraw();toast('Saved');
+    if(!S.mg)return;S.mg.d=d;S.mg.form=null;S.mg.mode=null;S.mg.tmp=null;mgDraw();toast('Saved');
     if(after)after();
   }).catch(function(e){if(S.mg&&S.mg.form)mgErr(e.message);else toast(e.message)});
 }
 function refreshDirs(){
   api('/api/dirs').then(function(d){S.dirs=d;buildNav();if(S.r.t==='home'||S.r.t==='my')draw()}).catch(function(){});
+  api('/api/usage').then(function(v){S.usage=v;buildNav()}).catch(function(){S.usage=null;buildNav()});
 }
 function mgSave(){
-  var m=S.mg,f=m.form,v=function(id){var e=$('#'+id);return e?e.value:''};
+  var m=S.mg,f=m.form;
   if(f.t==='user'){
-    if(f.mode==='self')mgRun('/api/manage/password',{current:v('mg-cur'),password:v('mg-pw')});
-    else mgRun('/api/manage/users',{action:f.mode,email:v('mg-email'),password:v('mg-pw'),allowedit:$('#mg-ed').checked});
+    if(f.mode==='self')mgRun('/api/manage/password',{current:val('mg-cur'),password:val('mg-pw')});
+    else mgRun('/api/manage/users',{action:f.mode,email:val('mg-email'),password:val('mg-pw'),allowedit:$('#mg-ed').checked});
   }else{
-    mgRun('/api/manage/dirs',{action:f.mode,index:f.i,dir:{name:v('mg-name'),id:v('mg-id'),type:v('mg-type'),protect:$('#mg-pr').checked}},refreshDirs);
+    mgRun('/api/manage/dirs',{action:f.mode,index:f.i,dir:{name:val('mg-name'),id:val('mg-id'),type:val('mg-type'),protect:$('#mg-pr').checked}},refreshDirs);
   }
 }
 
@@ -2121,7 +2291,6 @@ function updateSel(){
 var io=new IntersectionObserver(function(e){if(e[0].isIntersecting&&S.next&&!S.loading&&S.r.t==='f')loadFolder(true)},{rootMargin:'400px'});
 function draw(){
   var r=S.r,src=r.t==='home'?homeItems():r.t==='my'?diskItems():r.t==='starred'?S.stars:r.t==='recent'?S.recent:r.t==='shared'?S.shared:S.items,a=vis(src);S.vis=a;
-  var sc=$('#tools')?$('#tools').scrollLeft:0;
   $('#main').innerHTML='<div class="px-4 md:px-6 pt-4 pb-28 md:pb-10 min-h-full">'+(r.t==='f'?crumbsV():'')+'<div id="tools">'+toolsV()+'</div><div id="body">'+bodyV(a)+'</div></div>';
   drawInfo();
   var bd=$('#body');if(bd)bd.classList.toggle('sel-mode',S.sel.size>0);
@@ -2206,12 +2375,12 @@ function ctl(video){
    '<div class="flex items-center justify-center gap-3 mt-2"><button data-a="vspeed" class="state morph h-10 px-4 rounded-full bg-white/10 text-sm font-medium">'+S.rate+'x</button><button data-a="vmute" class="ib state text-white">'+ic('volume_up')+'</button><input id="vol" type="range" min="0" max="100" value="100" class="!w-28">'+(video?vbtn('vpip','picture_in_picture_alt','Picture in picture')+vbtn('vfs','fullscreen','Fullscreen'):'')+'</div></div>';
 }
 function renderViewer(){
-  var it=S.vw.it,k=kindOf(it),u=fu(it,true),d=fu(it),st='',nav='',c='';
+  var it=S.vw.it,k=kindOf(it),u=fu(it,true),st='',nav='',c='';
   var multi=S.pl.length>1&&plIdx()>=0;
   if(k==='image')st='<img id="vimg" data-a="vzoom" src="'+u+'" alt="" class="max-w-full max-h-full object-contain cursor-zoom-in">';
   else if(k==='video'){st='<video id="media" data-a="vplay" src="'+u+'" playsinline autoplay class="max-w-full max-h-full"></video>';c=ctl(true)}
   else if(k==='audio'){st='<audio id="media" src="'+u+'" autoplay></audio><div class="flex flex-col items-center gap-6 px-6 text-center"><div class="art rounded-full">'+ic('music_note','xl fill')+'</div><div><div class="text-2xl font-bold break-words">'+E(it.name.replace(/\.[^.]+$/,''))+'</div><div class="text-white/60 text-sm mt-1">'+E(dname(it.disk))+'</div></div></div>';c=ctl(false)}
-  else if(k==='pdf')st='<iframe src="'+u+'" class="w-full h-full bg-white border-0"></iframe>';
+  else if(k==='pdf')st='<div id="pdfbox" class="w-full h-full bg-neutral-700 text-white"></div>';
   else if(k==='text')st='<div id="txt" class="w-full h-full flex flex-col"><div class="m-auto text-white/60">Loading…</div></div>';
   else{
     st='<div class="bg-surface-container text-on-surface rounded-[40px] p-8 text-center max-w-md mx-4 w-full">'+kicon(it,'xl')+'<div class="mt-4 text-lg font-semibold break-words">'+E(it.name)+'</div><div class="text-sm text-on-surface-variant mt-1">'+KM[k][2]+' · '+sz(it.size)+'</div><div class="mt-6 text-xl">Preview not available</div><p class="text-sm text-on-surface-variant mt-2 mb-6">'+'This file type can’t be previewed in the browser.'+' Download it to open on your device, or share a link so others can get it.</p><div class="flex gap-2 justify-center flex-wrap"><button type="button" data-a="vdl" class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-primary text-on-primary font-medium state morph">'+ic('download','sm')+'Download</button><button type="button" data-a="vshare" class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-secondary-container text-on-secondary-container font-medium state morph">'+ic('share','sm')+'Share</button></div></div>';
@@ -2224,6 +2393,7 @@ function renderViewer(){
   var v=$('#viewer');v.classList.remove('playing');
   v.innerHTML=tb+'<div id="stage" class="flex-1 min-h-0 relative flex items-center justify-center overflow-hidden bg-black">'+st+nav+'</div>'+c;
   if(k==='video'||k==='audio')mountMedia();
+  if(k==='pdf')renderPdf($('#pdfbox'),u);
   if(k==='image'){
     var im=$('#vimg');if(im)im.onerror=function(){toast('Could not display this image')};
     [1,-1].forEach(function(o){var nb=S.pl[plIdx()+o];if(nb&&kindOf(nb)==='image'&&ext(nb.name)!=='heic'){var pi=new Image();pi.src=fu(nb,true)}});
@@ -2333,12 +2503,14 @@ document.addEventListener('click',function(e){
     case 'profile':var pf=$('#profile');if(pf.classList.contains('hidden')){pf.innerHTML=profileV();pf.classList.remove('hidden');$('#mscrim').classList.remove('hidden')}else closeMenu();break;
     case 'manage':closeMenu();mgLoad();break;
     case 'mgtab':mg.tab=x;mg.form=null;mgDraw();break;
-    case 'mgcfg':mgRun('/api/manage/config',{name:$('#mg-cname').value,favicon:$('#mg-cfav').value},function(){location.reload()});break;
+    case 'mgcfg':mgRun('/api/manage/config',{name:val('mg-cname'),favicon:val('mg-cfav')},function(){location.reload()});break;
+    case 'mgmode':mg.tmp={name:val('mg-cname'),fav:val('mg-cfav'),cid:val('mg-cid'),csec:val('mg-csec'),crt:val('mg-crt')};mg.mode=x;mgDraw();break;
+    case 'mgstorage':mgRun('/api/manage/storage',{mode:mg.mode||mg.d.storage.mode,creds:{client_id:val('mg-cid'),client_secret:val('mg-csec'),refresh_token:val('mg-crt')}},refreshDirs);break;
     case 'mguadd':mg.form={t:'user',mode:'add',email:'',allowedit:false};mgDraw();break;
     case 'mguedit':mg.form={t:'user',mode:'edit',email:mg.d.users[mi].email,allowedit:mg.d.users[mi].allowedit};mgDraw();break;
     case 'mgpass':mg.form={t:'user',mode:'self'};mgDraw();break;
     case 'mgudel':if(confirm('Delete '+mg.d.users[mi].email+'?'))mgRun('/api/manage/users',{action:'delete',email:mg.d.users[mi].email});break;
-    case 'mgdadd':mg.form={t:'dir',mode:'add',dir:{name:'',id:'',type:'folder',protect:false}};mgDraw();break;
+    case 'mgdadd':mg.form={t:'dir',mode:'add',dir:{name:'',id:'',type:mg.d.storage&&mg.d.storage.mode==='r2'?'r2':'folder',protect:false}};mgDraw();break;
     case 'mgdedit':mg.form={t:'dir',mode:'update',i:mi,dir:Object.assign({},mg.d.dirs[mi])};mgDraw();break;
     case 'mgddel':if(confirm('Remove location '+mg.d.dirs[mi].name+'?'))mgRun('/api/manage/dirs',{action:'delete',index:mi},refreshDirs);break;
     case 'mgsave':mgSave();break;
@@ -2367,7 +2539,6 @@ document.addEventListener('click',function(e){
     case 'shdays':S.shDays=+x;drawShare();break;
     case 'shadd':shAdd();break;
     case 'shrm':S.shTo.splice(mi,1);drawShare();break;
-    case 'shpick':if(S.shTo.indexOf(x)<0)S.shTo.push(x);drawShare();break;
     case 'shsend':shSend();break;
     case 'mkshare':mkShare();break;
     case 'cpshare':copy($('#shurl').value);break;
