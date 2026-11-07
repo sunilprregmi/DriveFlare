@@ -444,18 +444,25 @@ async function buildPath(token, scope, file) {
     }
     return null;
 }
-async function scopeFolders(token, root) {
+async function folderTree(token, root, cap = 600) {
     const hit = scopeCache.get(root);
-    if (hit && hit.expires > Date.now()) return hit.ids;
+    if (hit && hit.expires > Date.now()) return hit.map;
+    const map = new Map([[root, null]]);
     let level = [root];
-    const all = [root];
-    while (level.length && all.length < 80) {
-        const res = await Promise.all(level.map(id => driveList(token, `'${id}' in parents and mimeType = '${FOLDER}' and trashed = false`, null, { pageSize: "200", fields: "files(id)" })));
+    while (level.length && map.size < cap) {
+        const chunks = [];
+        for (let i = 0; i < level.length; i += 40) chunks.push(level.slice(i, i + 40));
+        const res = await Promise.all(chunks.map(ch => driveList(token, `(${ch.map(i => `'${i}' in parents`).join(" or ")}) and mimeType = '${FOLDER}' and trashed = false`, null, { pageSize: "1000", fields: "files(id,name,parents)" })));
         level = [];
-        for (const r of res) for (const f of r.files || []) if (all.length < 80) { all.push(f.id); level.push(f.id); }
+        for (const r of res) for (const f of r.files || []) {
+            if (map.size >= cap || map.has(f.id)) continue;
+            const ps = f.parents || [];
+            map.set(f.id, { name: f.name, parent: ps.find(x => map.has(x)) || ps[0] });
+            level.push(f.id);
+        }
     }
-    scopeCache.set(root, { ids: all, expires: Date.now() + 300000 });
-    return all;
+    scopeCache.set(root, { map, expires: Date.now() + 300000 });
+    return map;
 }
 
 async function apiList(url, env) {
@@ -476,27 +483,71 @@ async function apiSearch(url, env) {
     const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
     if (q.length < 2) return json({ files: [] });
     const [dirs, token] = await Promise.all([getdirs(env), getToken(env)]);
-    const d0 = dirs[Number(url.searchParams.get("disk"))];
+    const inId = url.searchParams.get("in") || "";
+    let disk = Number(url.searchParams.get("disk")), prefix = [], root = null, scopeName = null;
+    if (inId) {
+        if (!/^[\w-]{1,100}$/.test(inId)) return json({ error: "id" }, 400);
+        const loc = await locate(token, dirs, inId, null);
+        if (!loc) return json({ error: "Not found" }, 404);
+        disk = loc.disk;
+        if (loc.chain.length) {
+            root = inId === "root" ? await getRootId(token) : inId;
+            prefix = loc.chain.map(m => m.name);
+            scopeName = prefix[prefix.length - 1];
+        }
+    }
+    const d0 = dirs[disk];
     if (!d0) return json({ error: "disk" }, 404);
-    let query = q.split(/\s+/).slice(0, 5).map(t => `name contains '${esc(t)}'`).join(" and ") + ` and trashed = false and ${VISIBLE}`;
-    const extra = { pageSize: "50" };
-    let scope = d0.id;
-    if (d0.type === "shared_drive") { extra.corpora = "drive"; extra.driveId = d0.id; }
-    else if (d0.type === "folder") {
-        const ids = await scopeFolders(token, d0.id);
-        query += " and (" + ids.map(i => `'${i}' in parents`).join(" or ") + ")";
-        extra.corpora = "allDrives";
-    } else { extra.corpora = "user"; extra.includeItemsFromAllDrives = "false"; scope = await getRootId(token); }
-    const d = await driveList(token, query, null, extra);
-    const rows = await Promise.all((d.files || []).map(async f => {
-        const s = shapeOne(f);
-        if (!s) return null;
-        const names = await buildPath(token, scope, f);
-        if (!names) return null;
-        s.path = names.join("/");
-        return s;
-    }));
-    return json({ files: rows.filter(Boolean) });
+    if (!scopeName) scopeName = d0.name;
+    const base = q.split(/\s+/).slice(0, 5).map(t => `name contains '${esc(t)}'`).join(" and ") + ` and trashed = false and ${VISIBLE}`;
+    let out = [];
+    if (root || d0.type === "folder") {
+        const top = root || d0.id;
+        const map = await folderTree(token, top);
+        const ids = [...map.keys()];
+        const extra = { pageSize: "50" };
+        if (d0.type === "shared_drive") { extra.corpora = "drive"; extra.driveId = d0.id; }
+        else if (d0.type === "folder") extra.corpora = "allDrives";
+        else { extra.corpora = "user"; extra.includeItemsFromAllDrives = "false"; }
+        const chunks = [];
+        for (let i = 0; i < ids.length; i += 40) chunks.push(ids.slice(i, i + 40));
+        const res = await Promise.all(chunks.map(ch => driveList(token, base + " and (" + ch.map(i => `'${i}' in parents`).join(" or ") + ")", null, extra)));
+        const seen = new Set();
+        for (const r of res) for (const f of r.files || []) {
+            if (seen.has(f.id)) continue;
+            seen.add(f.id);
+            const s1 = shapeOne(f);
+            if (!s1) continue;
+            const names = [f.name];
+            let p = (f.parents || []).find(x => map.has(x));
+            while (p && p !== top) {
+                const n = map.get(p);
+                if (!n) { p = null; break; }
+                names.unshift(n.name);
+                p = n.parent;
+            }
+            if (p !== top) continue;
+            s1.path = prefix.concat(names).join("/");
+            out.push(s1);
+        }
+    } else {
+        const extra = { pageSize: "100" };
+        let scope = d0.id;
+        if (d0.type === "shared_drive") { extra.corpora = "drive"; extra.driveId = d0.id; }
+        else { extra.corpora = "user"; extra.includeItemsFromAllDrives = "false"; scope = await getRootId(token); }
+        const d = await driveList(token, base, null, extra);
+        const rows = await Promise.all((d.files || []).map(async f => {
+            const s1 = shapeOne(f);
+            if (!s1) return null;
+            const names = await buildPath(token, scope, f);
+            if (!names) return null;
+            s1.path = names.join("/");
+            return s1;
+        }));
+        out = rows.filter(Boolean);
+    }
+    out.sort((a, b) => (a.folder === b.folder ? a.name.localeCompare(b.name, undefined, { numeric: true }) : a.folder ? -1 : 1));
+    return json({ disk, scope: scopeName, files: out.slice(0, 150) });
 }
 
 function sameOrigin(request, url) {
@@ -505,43 +556,65 @@ function sameOrigin(request, url) {
     try { return new URL(request.headers.get("Referer") || "").host === url.host; } catch (e) { return false; }
 }
 
+function allowGet(request, url) {
+    const sfs = request.headers.get("Sec-Fetch-Site");
+    if (sfs) return sfs === "same-origin" || sfs === "none";
+    const ref = request.headers.get("Referer");
+    if (!ref) return true;
+    try { return new URL(ref).host === url.host; } catch (e) { return false; }
+}
+
 async function streamFile(request, token, f, inline, extra = {}) {
     const ext = extOf(f.name);
     if (!ALLOWED[ext]) return page(ERROR_PAGE, 403);
-    const headers = { Authorization: `Bearer ${token}` };
-    const range = request.headers.get("Range");
-    if (range) headers["Range"] = range;
-    let res;
-    for (let i = 0; i < 3; i++) {
-        res = await fetch(`${API}/${f.id}?alt=media&supportsAllDrives=true`, { method: "GET", headers });
-        if (res.ok || res.status === 416 || res.status === 404) break;
-        await new Promise(r => setTimeout(r, 500 * (i + 1)));
-    }
+    let range = request.headers.get("Range");
+    const get = async rg => {
+        const h = { Authorization: `Bearer ${token}` };
+        if (rg) h["Range"] = rg;
+        let r;
+        for (let i = 0; i < 3; i++) {
+            r = await fetch(`${API}/${f.id}?alt=media&supportsAllDrives=true`, { method: "GET", headers: h });
+            if (r.ok || r.status === 416 || r.status === 404) break;
+            await new Promise(x => setTimeout(x, 500 * (i + 1)));
+        }
+        return r;
+    };
+    let res = await get(range);
+    if (!res.ok && range && res.status !== 416 && res.status !== 404) { range = null; res = await get(null); }
     if (res.status === 404) return page(ERROR_PAGE, 404);
     if (!res.ok && res.status !== 416) return page(ERROR_PAGE, 403);
     const out = new Headers();
     out.set("Server", "nginx");
     out.set("Content-Type", ALLOWED[ext]);
-    out.set("Content-Disposition", `${inline ? "inline" : "attachment"}; filename="${f.name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "")}"; filename*=UTF-8''${encodeURIComponent(f.name)}`);
+    out.set("Content-Disposition", `${inline ? "inline" : "attachment"}; filename="${f.name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "")}"; filename*=UTF-8''${encodeURIComponent(f.name).replace(/['()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase())}`);
     out.set("Accept-Ranges", "bytes");
     out.set("X-Content-Type-Options", "nosniff");
     out.set("Referrer-Policy", "no-referrer");
     if (ext === "svg") out.set("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'");
     for (const k in extra) out.set(k, extra[k]);
+    const encoded = !!res.headers.get("Content-Encoding");
     const len = res.headers.get("Content-Length");
-    if (len) out.set("Content-Length", len);
-    else if (f.size && !range) out.set("Content-Length", f.size);
+    if (len && !encoded) out.set("Content-Length", len);
+    else if (f.size && !range && !encoded && res.ok) out.set("Content-Length", f.size);
     const cr = res.headers.get("Content-Range");
     if (cr) out.set("Content-Range", cr);
     if (request.method === "HEAD") return new Response(null, { status: res.status, headers: out });
     return new Response(res.body, { status: res.status, headers: out });
 }
 
+async function findFile(token, dirs, id) {
+    const f = await locateFile(token, dirs, id);
+    if (f) return f;
+    const m = await authFetch(token, `${API}/${id}?fields=id,name,mimeType,size,modifiedTime,trashed&supportsAllDrives=true`);
+    if (m && !m.trashed && m.mimeType !== FOLDER && !String(m.mimeType).startsWith("application/vnd.google-apps.")) return m;
+    return null;
+}
+
 async function apiShare(request, env, me) {
     const body = await readBody(request);
     const [dirs, token] = await Promise.all([getdirs(env), getToken(env)]);
     if (!/^[\w-]{10,100}$/.test(body.id || "")) return json({ error: "id" }, 400);
-    const f = await locateFile(token, dirs, body.id);
+    const f = await findFile(token, dirs, body.id);
     if (!f || !ALLOWED[extOf(f.name)]) return json({ error: "Cannot share this file" }, 400);
 
     if (Array.isArray(body.to)) {
@@ -907,7 +980,6 @@ async function handle(request, env) {
         if (path === "/api/usage") return apiUsage(env);
         if (path === "/api/userdata") return apiUserDataGet(env, user);
         if (path === "/api/shared") return apiShared(env, user);
-        if (path === "/api/users") return apiUsers(env, user);
         if (path === "/api/manage") {
             const me = await currentUser(request, env, url);
             return me ? apiManageGet(env, me) : json({ error: "auth" }, 401);
@@ -917,9 +989,9 @@ async function handle(request, env) {
 
     const fm = path.match(/^\/file\/([\w-]{10,100})(?:\/.*)?$/);
     if (fm) {
-        if (!user || !sameOrigin(request, url)) return page(ERROR_PAGE, 403);
+        if (!user || !allowGet(request, url)) return page(ERROR_PAGE, 403);
         const [dirs, token] = await Promise.all([getdirs(env), getToken(env)]);
-        const f = await locateFile(token, dirs, fm[1]);
+        const f = await findFile(token, dirs, fm[1]);
         if (!f) return page(ERROR_PAGE, 404);
         return streamFile(request, token, f, url.searchParams.get("inline") === "1");
     }
@@ -1427,8 +1499,17 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme)
 
 var tt;
 function toast(m){var t=$('#toast');t.textContent=m;t.classList.remove('opacity-0','translate-y-4');clearTimeout(tt);tt=setTimeout(function(){t.classList.add('opacity-0','translate-y-4')},2600)}
-function copy(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast('Copied')},function(){toast('Copy failed')})}
-function dl(it){var a=document.createElement('a');a.href=fu(it);a.download=it.name;document.body.appendChild(a);a.click();a.remove()}
+function copy(t){
+  var fb=function(){try{var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(a);a.focus();a.select();var ok=document.execCommand('copy');a.remove();toast(ok?'Copied':'Copy failed')}catch(e){toast('Copy failed')}};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(function(){toast('Copied')},fb);else fb();
+}
+function dl(it){
+  var u=fu(it);
+  fetch(u,{method:'HEAD',credentials:'same-origin'}).then(function(r){
+    if(!r.ok){toast('Download failed ('+r.status+')');return}
+    var a=document.createElement('a');a.href=u;a.download=it.name;a.rel='noopener';a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+  }).catch(function(){toast('Download failed')});
+}
 function api(u,opt){
   opt=opt||{};opt.headers=Object.assign({'X-U':String(S.u)},opt.headers||{});
   return fetch(u,opt).then(function(r){
@@ -1631,7 +1712,6 @@ function showInfo(it){if(desk()&&!S.vw){cfg.info=true;saveCfg();S.sel=new Set([k
 
 function shareDialog(it){
   S.shIt=it;S.shTo=[];
-  if(!S.allUsers.length)api('/api/users').then(function(d){S.allUsers=d.users||[];if(!$('#dlgw').classList.contains('hidden')&&S.shIt===it)drawShare()}).catch(function(){});
   drawShare();
 }
 function drawShare(){
@@ -1640,9 +1720,8 @@ function drawShare(){
   var h='<h2 class="text-2xl mb-4 break-words">Share “'+E(it.name)+'”</h2>'+seg('shmode',[['people','People','group'],['link','Anyone','public']],S.shMode)+'<div class="mt-4">';
   if(ppl){
     var chips=S.shTo.map(function(e,i){return '<span class="inline-flex items-center gap-1 h-9 pl-3 pr-1 rounded-full bg-secondary-container text-on-secondary-container text-sm max-w-full"><span class="truncate">'+E(e)+'</span><button data-a="shrm" data-i="'+i+'" class="ib !w-7 !h-7 state">'+ic('close','sm')+'</button></span>'}).join('');
-    var sugg=S.allUsers.filter(function(u){return S.shTo.indexOf(u)<0}).slice(0,6).map(function(u){return '<button data-a="shpick" data-x="'+E(u)+'" class="state morph h-9 px-3 rounded-xl border border-outline-variant text-sm text-on-surface-variant max-w-full truncate">'+E(u)+'</button>'}).join('');
-    h+='<div class="flex gap-2 mb-3"><input id="shemail" type="email" list="shlist" autocomplete="off" autocapitalize="off" placeholder="Add email" class="flex-1 min-w-0 h-12 rounded-xl border border-outline px-3 bg-transparent text-sm outline-none"><datalist id="shlist">'+S.allUsers.map(function(u){return '<option value="'+E(u)+'">'}).join('')+'</datalist><button data-a="shadd" class="h-12 px-5 rounded-full bg-secondary-container text-on-secondary-container font-medium state morph">Add</button></div>'+
-     (chips?'<div class="flex gap-2 flex-wrap mb-3">'+chips+'</div>':'')+(sugg?'<div class="text-xs text-on-surface-variant mb-2">Users</div><div class="flex gap-2 flex-wrap mb-3">'+sugg+'</div>':'')+
+    h+='<div class="flex gap-2 mb-3"><input id="shemail" type="email" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" name="share-recipient" placeholder="Add email" class="flex-1 min-w-0 h-12 rounded-xl border border-outline px-3 bg-transparent text-sm outline-none"><button data-a="shadd" class="h-12 px-5 rounded-full bg-secondary-container text-on-secondary-container font-medium state morph">Add</button></div>'+
+     (chips?'<div class="flex gap-2 flex-wrap mb-3">'+chips+'</div>':'')+
      '<div class="flex items-center gap-3 p-3 rounded-2xl bg-surface-container text-sm text-on-surface-variant">'+ic('lock','sm')+'They will see it in their Shared tab.</div><div id="shres" class="text-error text-sm mt-2 min-h-[1.25rem]"></div>'+
      '<div class="flex justify-end gap-2 mt-3"><button data-a="closedlg" class="h-10 px-6 rounded-full text-primary font-medium state morph">Cancel</button><button data-a="shsend" class="h-10 px-6 rounded-full bg-primary text-on-primary font-medium state morph flex items-center gap-2">'+ic('send','sm')+'Share</button></div>';
   }else{
@@ -1657,7 +1736,6 @@ function shAdd(){
   var inp=$('#shemail');if(!inp)return true;
   var v=inp.value.trim().toLowerCase();if(!v)return true;
   if(!EMAIL.test(v)){toast('Enter a valid email');return false}
-  if(S.allUsers.length&&S.allUsers.indexOf(v)<0){toast('No user with that email');return false}
   if(S.shTo.indexOf(v)<0)S.shTo.push(v);
   inp.value='';drawShare();return true;
 }
@@ -1695,18 +1773,20 @@ function loadFolder(more){
     d.files.forEach(function(f){f.disk=d.disk;f.loc=loc});
     S.items=S.items.concat(d.files);S.next=d.next||null;S.loading=false;
     document.title=(d.crumbs.length?d.crumbs[d.crumbs.length-1].name:dname(d.disk))+' - '+NAME;
-    buildNav();draw();
+    setPh(d.crumbs.length?d.crumbs[d.crumbs.length-1].name:dname(d.disk));buildNav();draw();
   }).catch(function(e){if(tok!==S.tok)return;S.err=e.message;S.loading=false;draw()});
 }
 function loadShared(){
   var tok=++S.tok;S.loading=true;S.err=null;draw();
   api('/api/shared').then(function(d){if(tok!==S.tok)return;S.shared=d.files||[];S.loading=false;draw()}).catch(function(e){if(tok!==S.tok)return;S.err=e.message;S.loading=false;draw()});
 }
-function doSearch(q){
+function doSearch(q,inId){
   var tok=++S.tok;S.items=[];S.next=null;S.loading=true;S.err=null;S.sel=new Set();draw();
-  Promise.all(S.dirs.map(function(d,i){return api('/api/search?disk='+i+'&q='+encodeURIComponent(q)).then(function(r){return r.files.map(function(f){f.disk=i;f.loc=dname(i)+(par(f.path)?' / '+par(f.path).split('/').join(' / '):'');return f})}).catch(function(){return []})})).then(function(rs){
-    if(tok!==S.tok)return;S.items=[].concat.apply([],rs);S.loading=false;draw();
-  });
+  var fix=function(r,i){return r.files.map(function(f){f.disk=i;f.loc=dname(i)+(par(f.path)?' / '+par(f.path).split('/').join(' / '):'');return f})};
+  var p=inId?api('/api/search?q='+encodeURIComponent(q)+'&in='+encodeURIComponent(inId)).then(function(r){setPh(r.scope);return fix(r,r.disk)}):Promise.all(S.dirs.map(function(d,i){return api('/api/search?disk='+i+'&q='+encodeURIComponent(q)).then(function(r){return fix(r,i)}).catch(function(){return []})})).then(function(rs){setPh(NAME);return [].concat.apply([],rs)});
+  p.then(function(a){
+    if(tok!==S.tok)return;S.items=a;S.loading=false;draw();
+  }).catch(function(e){if(tok!==S.tok)return;S.err=e.message;S.loading=false;draw()});
 }
 function diskItems(){return S.dirs.map(function(d,i){return {id:d.id,name:d.name,folder:true,home:true,disk:i,size:0,modified:null,loc:''}})}
 function homeItems(){return diskItems().concat(S.recent.slice(0,12))}
@@ -1819,12 +1899,14 @@ function draw(){
   io.disconnect();var s=$('#sent');if(s)io.observe(s);
   var act=document.querySelector('#tools [data-a=filter].bg-secondary-container');if(act&&act.scrollIntoView&&S.filter!=='all')act.scrollIntoView({inline:'center',block:'nearest'});
 }
+function setPh(n){var q=$('#q');if(q)q.placeholder='Search in '+n}
+function shp(v){var id=S.r.t==='f'?S.r.id:S.r.t==='s'?S.r.in:'';return 'search/'+encodeURIComponent(v)+(id?'/'+encodeURIComponent(id):'')}
 function parseHash(){
   var p=location.hash.replace(/^#\/?/,'').split('/'),u=null;
   if(p[0]==='u'&&/^\d+$/.test(p[1]||'')){u=+p[1];p=p.slice(2)}
   var t=p[0]||'home';
   t={'my-drive':'my','folders':'f','f':'f','search':'s','s':'s'}[t]||t;
-  return {u:u,t:t,a:p[1],rest:p.join('/')};
+  return {u:u,t:t,a:p[1],n:p[2],rest:p.join('/')};
 }
 function route(){
   var h=parseHash();
@@ -1836,11 +1918,11 @@ function route(){
   if(t==='f'){
     var id=decodeURIComponent(h.a||'root'),di=S.dirs.findIndex(function(d){return d.id===id});if(di>=0)S.hint=di;
     S.r={t:'f',id:id};$('#q').value='';buildNav();loadFolder();
-  }else if(t==='s'){var q=decodeURIComponent(h.a||'');S.r={t:'s',q:q};$('#q').value=q;document.title=q+' - '+NAME;buildNav();doSearch(q)}
+  }else if(t==='s'){var q=decodeURIComponent(h.a||'');S.r={t:'s',q:q,in:h.n?decodeURIComponent(h.n):''};$('#q').value=q;document.title=q+' - '+NAME;buildNav();doSearch(q,S.r.in)}
   else{
     S.r={t:t==='starred'||t==='recent'||t==='my'||t==='shared'?t:'home'};S.items=[];S.loading=false;S.err=null;
     document.title=S.r.t==='my'?'My Drive - '+NAME:S.r.t==='shared'?'Shared - '+NAME:NAME;
-    $('#q').value='';buildNav();draw();
+    $('#q').value='';setPh(NAME);buildNav();draw();
     if(S.r.t==='shared')loadShared();
   }
   $('#qc').classList.toggle('hidden',!$('#q').value);
@@ -1896,23 +1978,20 @@ function ctl(video){
 }
 function renderViewer(){
   var it=S.vw.it,k=kindOf(it),u=fu(it,true),d=fu(it),st='',nav='',c='';
-  if(k==='archive'&&ext(it.name)==='zip'&&it.size&&it.size<=26214400)k='zip';
   var multi=S.pl.length>1&&plIdx()>=0;
   if(k==='image')st='<img id="vimg" data-a="vzoom" src="'+u+'" alt="" class="max-w-full max-h-full object-contain cursor-zoom-in">';
   else if(k==='video'){st='<video id="media" data-a="vplay" src="'+u+'" playsinline autoplay class="max-w-full max-h-full"></video>';c=ctl(true)}
   else if(k==='audio'){st='<audio id="media" src="'+u+'" autoplay></audio><div class="flex flex-col items-center gap-6 px-6 text-center"><div class="art rounded-full">'+ic('music_note','xl fill')+'</div><div><div class="text-2xl font-bold break-words">'+E(it.name.replace(/\.[^.]+$/,''))+'</div><div class="text-white/60 text-sm mt-1">'+E(dname(it.disk))+'</div></div></div>';c=ctl(false)}
   else if(k==='pdf')st='<iframe src="'+u+'" class="w-full h-full bg-white border-0"></iframe>';
   else if(k==='text')st='<div id="txt" class="w-full h-full flex flex-col"><div class="m-auto text-white/60">Loading…</div></div>';
-  else if(k==='zip')st='<div id="zip" class="w-full h-full flex flex-col bg-surface-low text-on-surface"><div class="m-auto"><div class="loader"></div></div></div>';
   else{
-    var big=k==='archive'&&ext(it.name)==='zip';
-    st='<div class="bg-surface-container text-on-surface rounded-[40px] p-8 text-center max-w-md mx-4 w-full">'+kicon(it,'xl')+'<div class="mt-4 text-lg font-semibold break-words">'+E(it.name)+'</div><div class="text-sm text-on-surface-variant mt-1">'+KM[k][2]+' · '+sz(it.size)+'</div><div class="mt-6 text-xl">Preview not available</div><p class="text-sm text-on-surface-variant mt-2 mb-6">'+(big?'Zip files over 25 MB can’t be previewed in the browser.':'This file type can’t be previewed in the browser.')+' Download it to open on your device, or share a link so others can get it.</p><div class="flex gap-2 justify-center flex-wrap"><a href="'+d+'" download class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-primary text-on-primary font-medium state morph">'+ic('download','sm')+'Download</a><button type="button" data-a="vshare" class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-secondary-container text-on-secondary-container font-medium state morph">'+ic('share','sm')+'Share</button></div></div>';
+    st='<div class="bg-surface-container text-on-surface rounded-[40px] p-8 text-center max-w-md mx-4 w-full">'+kicon(it,'xl')+'<div class="mt-4 text-lg font-semibold break-words">'+E(it.name)+'</div><div class="text-sm text-on-surface-variant mt-1">'+KM[k][2]+' · '+sz(it.size)+'</div><div class="mt-6 text-xl">Preview not available</div><p class="text-sm text-on-surface-variant mt-2 mb-6">'+'This file type can’t be previewed in the browser.'+' Download it to open on your device, or share a link so others can get it.</p><div class="flex gap-2 justify-center flex-wrap"><button type="button" data-a="vdl" class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-primary text-on-primary font-medium state morph">'+ic('download','sm')+'Download</button><button type="button" data-a="vshare" class="inline-flex items-center gap-2 h-12 px-6 rounded-full bg-secondary-container text-on-secondary-container font-medium state morph">'+ic('share','sm')+'Share</button></div></div>';
   }
   if(multi)nav='<button type="button" data-a="vprev" title="Previous" class="vnav" style="left:12px">'+ic('chevron_left','lg')+'</button><button type="button" data-a="vnext" title="Next" class="vnav" style="right:12px">'+ic('chevron_right','lg')+'</button>';
   var tb='<div class="flex items-center gap-0 sm:gap-1 px-1 sm:px-2 h-16 shrink-0 z-10">'+vbtn('vclose','arrow_back','Close')+'<span class="mx-1 sm:mx-2 min-w-0 flex-1 truncate font-medium">'+E(it.name)+'</span>'+
    (multi?'<span class="hidden sm:inline text-xs text-white/60 mr-2">'+(plIdx()+1)+' / '+S.pl.length+'</span>':'')+
    '<button data-a="vstar" class="ib state text-white">'+ic('star',isStar(it)?'fill text-yellow-300':'')+'</button>'+vbtn('vinfo','info','Details')+vbtn('vshare','share','Share')+
-   '<a class="ib state text-white hidden sm:inline-grid" href="'+u+'" target="_blank" rel="noopener" title="Open in new tab">'+ic('open_in_new')+'</a><a class="ib state text-white" href="'+d+'" download title="Download">'+ic('download')+'</a></div>';
+   '<a class="ib state text-white hidden sm:inline-grid" href="'+u+'" target="_blank" rel="noopener" title="Open in new tab">'+ic('open_in_new')+'</a><button type="button" data-a="vdl" class="ib state text-white" title="Download">'+ic('download')+'</button></div>';
   var v=$('#viewer');v.classList.remove('playing');
   v.innerHTML=tb+'<div id="stage" class="flex-1 min-h-0 relative flex items-center justify-center overflow-hidden bg-black">'+st+nav+'</div>'+c;
   if(k==='video'||k==='audio')mountMedia();
@@ -1928,42 +2007,20 @@ function renderViewer(){
       if(Math.abs(dx)>60&&!(z&&z.classList.contains('zoomed')))step(dx<0?1:-1);
     };
   }
-  if(k==='zip')fetch(u).then(function(r){if(!r.ok)throw new Error('Could not load the file');return r.arrayBuffer()}).then(function(buf){if(!S.vw||S.vw.it!==it)return;S.zip={buf:buf,ents:zipParse(buf)};renderZip()}).catch(function(er){var z=$('#zip');if(z)z.innerHTML='<div class="m-auto text-center p-6">'+ic('error','xl text-error')+'<div class="mt-3">'+E(er.message)+'</div></div>'});
-  if(k==='text')fetch(u,{headers:{Range:'bytes=0-1048575'}}).then(function(r){return r.text()}).then(function(t){if(S.vw&&S.vw.it===it){S.txt=t;renderText(it,false)}}).catch(function(){var e=$('#txt');if(e)e.textContent='Could not load file.'});
-}
-function zipParse(buf){
-  var dv=new DataView(buf),n=buf.byteLength,e=-1,i,pad=function(x){return (x<10?'0':'')+x};
-  for(i=n-22;i>=Math.max(0,n-65558);i--){if(dv.getUint32(i,true)===0x06054b50){e=i;break}}
-  if(e<0)throw new Error('This is not a valid zip file');
-  var cnt=dv.getUint16(e+10,true),p=dv.getUint32(e+16,true);
-  if(cnt===0xFFFF||p===0xFFFFFFFF)throw new Error('Zip64 archives are not supported');
-  var out=[],u8=new Uint8Array(buf),old=new TextDecoder('windows-1252');
-  for(i=0;i<cnt&&out.length<5000;i++){
-    if(p+46>n||dv.getUint32(p,true)!==0x02014b50)break;
-    var fl=dv.getUint16(p+8,true),tm=dv.getUint16(p+12,true),dd=dv.getUint16(p+14,true),nl=dv.getUint16(p+28,true),el=dv.getUint16(p+30,true),cl=dv.getUint16(p+32,true),nb=u8.subarray(p+46,p+46+nl),nm;
-    try{nm=new TextDecoder('utf-8',{fatal:true}).decode(nb)}catch(x){nm=old.decode(nb)}
-    out.push({name:nm,dir:nm.charAt(nm.length-1)==='/',enc:!!(fl&1),method:dv.getUint16(p+10,true),csize:dv.getUint32(p+20,true),usize:dv.getUint32(p+24,true),off:dv.getUint32(p+42,true),date:dd?((dd>>9)+1980)+'-'+pad((dd>>5)&15)+'-'+pad(dd&31)+' '+pad(tm>>11)+':'+pad((tm>>5)&63):''});
-    p+=46+nl+el+cl;
-  }
-  return out;
-}
-function zipExtract(ent){
-  var buf=S.zip.buf,dv=new DataView(buf),o=ent.off;
-  if(dv.getUint32(o,true)!==0x04034b50)return Promise.reject(new Error('Corrupt entry'));
-  var start=o+30+dv.getUint16(o+26,true)+dv.getUint16(o+28,true),bl=new Blob([buf.slice(start,start+ent.csize)]);
-  if(ent.method===0)return Promise.resolve(bl);
-  if(ent.method===8&&window.DecompressionStream)return new Response(bl.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
-  return Promise.reject(new Error('Unsupported compression'));
-}
-function renderZip(){
-  var z=S.zip,tot=0,files=0;
-  z.ents.forEach(function(e){if(!e.dir){files++;tot+=e.usize}});
-  var rows=z.ents.map(function(e,i){
-    var base=e.name.replace(/\/$/,''),k=base.lastIndexOf('/'),dir=k<0?'':base.slice(0,k+1),nm=k<0?base:base.slice(k+1);
-    var icn=e.dir?'<span class="ms fill" style="color:var(--m-on-surface-variant)">folder</span>':kicon({name:nm,folder:false});
-    return '<div class="flex items-center gap-3 px-4 h-12 rounded-xl hover:bg-surface-high"><span class="shrink-0">'+icn+'</span><div class="min-w-0 flex-1 truncate text-sm"><span class="text-on-surface-variant">'+E(dir)+'</span><span class="font-medium">'+E(nm)+'</span></div><span class="hidden sm:block text-xs text-on-surface-variant w-20 text-right">'+(e.dir?'':sz(e.usize))+'</span><span class="hidden md:block text-xs text-on-surface-variant w-36 text-right">'+E(e.date)+'</span>'+(e.dir?'<span class="w-10 shrink-0"></span>':'<button data-a="zdl" data-i="'+i+'" class="ib state" title="'+(e.enc?'Encrypted':'Download')+'"'+(e.enc?' disabled style="opacity:.4"':'')+'>'+ic(e.enc?'lock':'download')+'</button>')+'</div>';
-  }).join('');
-  $('#zip').innerHTML='<div class="flex items-center gap-2 px-5 h-12 shrink-0 text-sm text-on-surface-variant">'+ic('folder_zip','sm')+'<span class="flex-1">'+files+' files · '+sz(tot)+' uncompressed</span></div><div class="flex-1 overflow-auto px-2 pb-4">'+(rows||'<div class="text-center py-16 text-on-surface-variant">Empty archive</div>')+'</div>';
+  if(k==='text')fetch(u,{credentials:'same-origin'}).then(function(r){
+    if(!r.ok)throw new Error('Could not load file.');
+    if(!r.body||!r.body.getReader)return r.text();
+    var rd=r.body.getReader(),ch=[],n=0,LIM=1048576;
+    var pump=function(){return rd.read().then(function(x){
+      if(x.done||n>=LIM){rd.cancel().catch(function(){});return}
+      ch.push(x.value);n+=x.value.length;return pump();
+    })};
+    return pump().then(function(){
+      var all=new Uint8Array(Math.min(n,LIM)),o=0;
+      ch.forEach(function(c){var take=Math.min(c.length,all.length-o);if(take>0){all.set(c.subarray(0,take),o);o+=take}});
+      return new TextDecoder('utf-8').decode(all);
+    });
+  }).then(function(t){if(S.vw&&S.vw.it===it){S.txt=t;renderText(it,false)}}).catch(function(er){var e=$('#txt');if(e)e.innerHTML='<div class="m-auto text-white/60">'+E(er.message||'Could not load file.')+'</div>'});
 }
 function csvRows(t){var rows=[],r=[],c='',q=false;for(var i=0;i<t.length&&rows.length<500;i++){var ch=t[i];if(q){if(ch==='"'){if(t[i+1]==='"'){c+='"';i++}else q=false}else c+=ch}else if(ch==='"')q=true;else if(ch===','){r.push(c);c=''}else if(ch==='\n'){r.push(c.replace(/\r$/,''));rows.push(r);r=[];c=''}else c+=ch}if(c||r.length){r.push(c);rows.push(r)}return rows}
 function renderText(it,table){
@@ -2098,7 +2155,7 @@ document.addEventListener('click',function(e){
     case 'vinfo':details(S.vw.it);break;
     case 'vshare':shareDialog(S.vw.it);break;
     case 'vstar':toggleStar(S.vw.it);break;
-    case 'zdl':var ze=S.zip&&S.zip.ents[+t.dataset.i];if(ze&&!ze.enc){toast('Preparing…');zipExtract(ze).then(function(bl){var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download=ze.name.split('/').pop();document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href)},4000)}).catch(function(er){toast(er.message)})}break;
+    case 'vdl':dl(S.vw.it);break;
     case 'txtmode':renderText(S.vw.it,!S.txtTable);break;
     case 'txtcopy':copy(S.txt);break;
     case 'vzoom':var z=t.classList.toggle('zoomed');t.style.maxWidth=z?'none':'';t.style.maxHeight=z?'none':'';t.classList.toggle('cursor-zoom-out',z);t.classList.toggle('cursor-zoom-in',!z);t.parentNode.style.overflow=z?'auto':'hidden';break;
@@ -2137,9 +2194,9 @@ document.addEventListener('keydown',function(e){
 var qt;
 $('#q').addEventListener('input',function(){
   var v=this.value.trim();$('#qc').classList.toggle('hidden',!this.value);clearTimeout(qt);
-  if(v.length>=2)qt=setTimeout(function(){var h=H('search/'+encodeURIComponent(v));if(location.hash!==h)location.replace(h)},500);
+  if(v.length>=2)qt=setTimeout(function(){var h=H(shp(v));if(location.hash!==h)location.replace(h)},500);
 });
-$('#q').addEventListener('keydown',function(e){if(e.key==='Enter'){var v=this.value.trim();if(v){clearTimeout(qt);location.hash=H('search/'+encodeURIComponent(v))}this.blur()}});
+$('#q').addEventListener('keydown',function(e){if(e.key==='Enter'){var v=this.value.trim();if(v){clearTimeout(qt);location.hash=H(shp(v))}this.blur()}});
 $('#lshow').addEventListener('change',function(){$('#lp').type=this.checked?'text':'password'});
 window.addEventListener('hashchange',function(){if(S.me)route()});
 document.addEventListener('visibilitychange',function(){
@@ -2151,7 +2208,7 @@ document.addEventListener('visibilitychange',function(){
 function boot(){
   $('#login').classList.add('hidden');$('#login').classList.remove('flex');$('#app').classList.remove('hidden');
   $('#avatar').textContent=S.me.charAt(0).toUpperCase();
-  api('/api/dirs').then(function(d){S.dirs=d;route();pullUD();api('/api/users').then(function(r){S.allUsers=r.users||[]}).catch(function(){});api('/api/usage').then(function(v){S.usage=v;buildNav();if(!$('#profile').classList.contains('hidden'))$('#profile').innerHTML=profileV()}).catch(function(){S.usage=null})}).catch(function(e){if(S.me)$('#main').innerHTML='<div class="text-center py-24">'+ic('cloud_off','xl')+'<div class="mt-3">Could not load storage locations.</div></div>'});
+  api('/api/dirs').then(function(d){S.dirs=d;route();pullUD();api('/api/usage').then(function(v){S.usage=v;buildNav();if(!$('#profile').classList.contains('hidden'))$('#profile').innerHTML=profileV()}).catch(function(){S.usage=null})}).catch(function(e){if(S.me)$('#main').innerHTML='<div class="text-center py-24">'+ic('cloud_off','xl')+'<div class="mt-3">Could not load storage locations.</div></div>'});
 }
 applyTheme();
 if('serviceWorker' in navigator)window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){})});
